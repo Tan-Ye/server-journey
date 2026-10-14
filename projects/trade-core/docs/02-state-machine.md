@@ -5,7 +5,7 @@
 > **本文档是订单状态的唯一真相源。** 合法转移只在这里定义一次，代码里的状态机模块必须与本文逐行对应。
 > DoD #3（回调幂等 / 乱序回调不破坏状态机）能否通过，取决于本文有没有定义清楚的「每个事件只生效一次」机制。
 >
-> 上游：`01-usecases.md`（五个用例的分支表） · 下游：`02-api-contract.md`（错误码）、`03-dod.md`（表字段草案）
+> 上游：`01-usecases.md`（六个用例的分支表） · 下游：`02-api-contract.md`（错误码）、`03-dod.md`（表字段草案）
 
 ## 1. 状态转移图
 
@@ -40,6 +40,7 @@ stateDiagram-v2
     REFUNDING --> REFUNDING : 退款失败重试
     PARTIALLY_REFUNDED --> REFUNDED : 退货入库（补记）
     PARTIALLY_REFUNDED --> PARTIALLY_REFUNDED : 退货入库（部分到仓）
+    PARTIALLY_REFUNDED --> PAID : 撤销退款申请（货未离仓）
     REFUNDED --> REFUNDED : 退货入库（补记）
     CANCELLED --> [*]
     COMPLETED --> [*]
@@ -47,11 +48,11 @@ stateDiagram-v2
     REFUNDED --> [*]
 ```
 
-> **图中的两个汇合点**
+> **图里三个容易看漏的地方**
 >
 > 1. **`REFUNDING` 有两条边指向 `REFUNDED`**：「退款成功」（支付方回调）和「退货入库」（货到仓）。两条边的**触发源不同、库存动作不同**，但都是同一个终态的合法入口 —— 实现时必须都覆盖，不能只做支付方回调那一条。
-> 2. **两个「补记库存」自环**：`REFUNDED → REFUNDED` 与 `PARTIALLY_REFUNDED → PARTIALLY_REFUNDED`。它们存在的唯一原因是「钱退了、货还在路上」，到仓时必须补记库存，而订单已经是终态/半终态、不能再变。自环是这里唯一正确的表达 —— 状态不变，库存照记。
-> 3. **两条「往回走」的边（撤销退款申请）**：`REFUNDING → PAID` 与 `REFUNDING → SHIPPED`。它们指向的是**申请退款之前的那个状态**，不是固定终点 —— 具体回哪个由 `order_items.refund_from_status` 决定（见 T18）。图里画两条是因为 Mermaid 无法表达「回原状态」这种动态终点。
+> 2. **三个「补记库存」自环**：`REFUNDED → REFUNDED`、`PARTIALLY_REFUNDED → PARTIALLY_REFUNDED`，加上 `REFUNDING → REFUNDING`（退款失败重试，不涉库存）。自环存在的唯一原因是「钱退了、货还在路上」，到仓时必须补记库存，而订单已经是终态/半终态、不能再变。自环是这里唯一正确的表达 —— 状态不变，库存照记。
+> 3. **三条「往回走」的边（撤销退款申请）**：`REFUNDING → PAID`、`REFUNDING → SHIPPED`、`PARTIALLY_REFUNDED → PAID`。它们指向的是**申请退款之前的那个状态**，不是固定终点 —— 具体回哪个由 `order_items.refund_from_status` 决定（见 T18）。图里逐条画出是因为 Mermaid 无法表达「回原状态」这种动态终点。
 
 ## 2. 状态集合
 
@@ -73,8 +74,19 @@ stateDiagram-v2
 2. **`DELIVERED` 与 `COMPLETED` 之间隔着 7 天**，这 7 天就是退货窗口。`DELIVERED` 必须存在，否则「已签收但未过退货期」没有状态可表达。
 3. **`DELIVERED` / `COMPLETED` 的货不在四栏库存里** —— 已交付用户，离开 INV-2 恒等式（见 `01-usecases.md`）。
 4. **`REFUNDED` 与 `PARTIALLY_REFUNDED` 是仅有的两个「已收尾但库存仍会变动」的状态**（退货在途场景），这是 INV-7 的明文例外。
-5. **`PARTIALLY_REFUNDED` 是半终态**：它意味着「钱已经退给用户，但货还在路上」。常规出口是 `REFUNDED`（货到仓后收尾）—— 因为钱已经出去了，这一般不可逆，唯一例外是「货未动且可重新预占成功」时允许撤销（见 T18b）。除此之外不接受任何新动作。
-6. **`REFUNDING` 不是终态，可撤销**（T18/T18a/T18b）：只要**钱还没退出去**且**货未到仓**，用户就能撤销退款申请。撤销的终点不是固定状态，而是 `order_items.refund_from_status` 记录的「申请退款之前的状态」。
+5. **`PARTIALLY_REFUNDED` 是半终态**：它意味着「钱已经退给用户，但货还在路上」。常规出口是 `REFUNDED`（货到仓后收尾）—— 因为钱已经出去了，这一般不可逆；唯一例外是「货从未离仓且能重新预占成功」时允许撤销（T18b，钱会以 `REVOKED` 留在 `refunds` 里，不会消失）。除此之外不接受任何新动作。
+6. **`REFUNDING` 与 `PARTIALLY_REFUNDED` 都可撤销**（T18/T18a/T18b）：只要**钱还没退出去**且**货未到仓**（`PARTIALLY_REFUNDED` 额外要求货从未离仓），用户就能撤销退款申请。撤销的终点不是固定状态，而是 `order_items.refund_from_status` 记录的「申请退款之前的状态」。
+
+### `order_items.refund_status` 取值
+
+| 取值 | 含义 | 钱的状态 | 可否再次申请退款 |
+| --- | --- | --- | --- |
+| `NONE` | 无退款 | — | 可以 |
+| `REFUNDING` | 退款在途 | 未退出或已发出 | 否 |
+| `REFUNDED` | 退款完成 | 已退出且货已归位 | 否 |
+| `REVOKED` | 撤销成功但**钱曾发出过** | 已发出、结果待人工确认 | 允许（但会命中【需人工介入】#1） |
+
+> **为什么撤销要区分 `NONE` 和 `REVOKED`**：`refunds.status IN ('PENDING','CREATED')` 意味着钱从未离开我方，撤销后干净地回到 `NONE`；而 `SENT` 意味着支付方可能已经把钱退给用户了 —— 这时状态能回到申请前，但**「钱曾发出过」这个事实不能丢**，必须留在 `refunds` 表里并打【需人工介入】#1 标注。丢掉它就会变成「系统认为没退过款，用户却收到了钱」。
 
 ### 订单状态如何由订单项聚合而来
 
@@ -82,12 +94,16 @@ stateDiagram-v2
 
 | 订单项 `refund_status` 分布 | 订单级状态 | 说明 |
 | --- | --- | --- |
-| 全部 `NONE` | 保持 `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` | 无退款 |
-| 部分项 `REFUNDING` 或 `REFUNDED`，部分项 `NONE` | `PARTIALLY_REFUNDED` | **部分退款的落点** |
-| 全部项 `REFUNDING` | `REFUNDING` | 整单在退 |
+| 全部 `NONE`（或 `REVOKED`） | 保持 `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` | 无在途退款（`REVOKED` 只说明「曾申请过」，不构成退款状态） |
+| 存在 `REFUNDING` 项，且**钱尚未退出** | `REFUNDING` | 退款处理中，$0 已退 |
+| 存在 `REFUNDED` 项（钱已退），且退款项**货未回仓** | `PARTIALLY_REFUNDED` | 钱已退、货在路上 |
+| 全部项 `REFUNDING`，且**钱已退出** | `REFUNDING` | 整单在退 |
 | 全部项 `REFUNDED` | `REFUNDED` | 整单退完 |
+| `REFUNDING` + `NONE` 混合（部分退） | `PARTIALLY_REFUNDED` | v1 不会出现 |
 
-> **v1 的约束**：所有项必须一起退（`PARTIAL_REFUND_NOT_SUPPORTED`），所以 v1 里 `PARTIALLY_REFUNDED` **不会出现**。它现在就建好，是为了让「放开部分退货」变成删一行校验，而不是改状态机。
+> **关键区分**：`REFUNDING` 与 `PARTIALLY_REFUNDED` 的分界不是「退了几项」，而是**「钱退出去了没有」**。钱还在我方 → `REFUNDING`（可撤销）；钱已到用户那儿 → `PARTIALLY_REFUNDED`（不可逆，只能等货回仓）。
+
+> **v1 的约束**：所有项必须一起退（`PARTIAL_REFUND_NOT_SUPPORTED`），所以 v1 里 `PARTIALLY_REFUNDED` **只会由「钱先到、货在途」这一条路径进入**，不会由部分退货进入。它现在就建好，是为了让「放开部分退货」变成删一行校验，而不是改状态机。
 
 ## 3. 事件清单与触发源
 
@@ -115,6 +131,11 @@ stateDiagram-v2
 
 **图例**：`意图` = 调用方想做什么（可能被拒）；`生效条件` = 数据库 `WHERE` 子句；`库存动作` 与状态变更同一事务。
 
+**两条全局约定**（表中不再重复）：
+
+1. **`n` 的含义**：本**次操作范围内**的订单项数量合计 —— 下单时是本次要预占的量，退款时是本次要归还的量，签收时是**本次到仓的包裹**里的量（一个包裹可能只含部分订单项）。
+2. **申请退款的四项（T7 / T10 / T12 / T13）额外带一个前置**：`order_items.refund_status IN ('NONE','REVOKED') AND refunds.status NOT IN ('PENDING','CREATED')` —— 防止在已有在途退款、或刚撤销又重放的情况下重复发起。
+
 | # | 从 → 到 | 事件 | 意图 | 生效条件（WHERE） | 库存动作 | 幂等机制 |
 | --- | --- | --- | --- | --- | --- | --- |
 | T1 | `[*]` → `PENDING_PAYMENT` | `ORDER_CREATED` | 创建订单 | `available >= n`（预占） | `available -= n`，`reserved += n` | `idempotency_keys` 唯一约束 |
@@ -140,7 +161,7 @@ stateDiagram-v2
 | T17 | `REFUNDING` → `REFUNDING` | `REFUND_FAILED` | 退款失败，可重试 | `status='REFUNDING'` | 无 | `refunds.attempt_count` 自增 |
 | T18 | `REFUNDING` → `PAID` | `REFUND_REVOKED` | 撤销退款申请（**货未动过**） | `status='REFUNDING'` 且 `refund_from_status='PAID'` 且 `refunds.status IN ('PENDING','CREATED')` 且无 `refund_shipped_at` | **反向预占**：`available -= n`，`reserved += n`（与 T7 严格互逆） | 条件更新 + `refunds.status` 前置 |
 | T18a | `REFUNDING` → `SHIPPED` | `REFUND_REVOKED` | 撤销退款申请（**在途单，货继续送**） | `status='REFUNDING'` 且 `refund_from_status='SHIPPED'` 且 `refunds.status IN ('PENDING','CREATED')` | 无（货在途，维持 `in_transit`） | 同上 |
-| T18b | `REFUNDING` / `PARTIALLY_REFUNDED` → `PAID` | `REFUND_REVOKED` | 撤销（整单场景，货未离仓） | 同上 + 全部 `order_items.return_received_at IS NULL` | 反向预占：`available -= n`，`reserved += n` | 同上 + **重新预占失败即整体回滚** |
+| T18b | `REFUNDING` / `PARTIALLY_REFUNDED` → `PAID` | `REFUND_REVOKED` | 撤销（钱已退但货未离仓 → 退钱需人工） | 同上 + 货从未离仓（无 `refund_shipped_at`、无 `return_received_at`） | 反向预占：`available -= n`，`reserved += n` | 同上 + **重新预占失败即整体回滚** |
 
 **T18/T18a/T18b：撤销退款申请的判定轴**
 
@@ -208,7 +229,7 @@ DoD #3 与 #4 全部依赖这三道闸门。**任何状态转移都必须同时�
 | --- | --- | --- | --- |
 | 闸门 1 · 请求级 | `idempotency_keys` 表（`key` 唯一 + 请求指纹） | 用户重复提交下单 | T1 |
 | 闸门 2 · 事件级 | `payment_events.event_id` 唯一约束（`ON CONFLICT DO NOTHING`） | 支付方重放回调 | T2、T3、T8、T14、T14a、T17 |
-| 闸门 3 · 状态级 | **条件更新**：`UPDATE ... WHERE id=? AND status='期望状态'`，靠影响行数判断自己是否赢家 | 所有并发触发（队列 + 扫描 + 用户 + 调度器） | **全部 T1–T17**（含 T14a、T15a、T16a、T16b） |
+| 闸门 3 · 状态级 | **条件更新**：`UPDATE ... WHERE id=? AND status='期望状态'`，靠影响行数判断自己是否赢家 | 所有并发触发（队列 + 扫描 + 用户 + 调度器） | **全部 T1–T18b**（24 条边，无例外） |
 
 > **闸门 3 是最后一道、也是最关键的一道**。即使闸门 1、2 全被绕过（例如同一条业务边被两个不同触发源唤起 —— 延迟队列与扫描兜底、自动发货与手动发货），条件更新仍能保证只有一个生效、库存只动一次。
 >
@@ -231,7 +252,7 @@ DoD #3 与 #4 全部依赖这三道闸门。**任何状态转移都必须同时�
 | T14 / T14a | `orders` + `refunds.status` + `order_items.refund_status` | 更新缓存 |
 | T15 / T15a / T16 / T16a / T16b | `orders` + `order_items.return_*` + `stock` | 更新缓存 |
 | T17 | `refunds.attempt_count` + `last_error` | 退避重试入队、连续失败 N 次告警【需人工介入】 |
-| T18 / T18a / T18b | `orders`（回 `refund_from_status`）+ `order_items.refund_status='NONE'` + `refunds.status='REVOKED'` + `stock`（仅 T18/T18b 反向预占） | 更新缓存、**取消支付方的退款请求**（若其接口支持） |
+| T18 / T18a / T18b | `orders`（回 `refund_from_status`）+ `order_items.refund_status`（钱未曾发出 → `'NONE'`；**钱曾发出过 → `'REVOKED'`**）+ `refunds.status='REVOKED'` + `stock`（仅 T18/T18b 反向预占） | 更新缓存、**取消支付方的退款请求**（若其接口支持） |
 
 **跨表铁律**：`orders.status` 与 `stock` 的变更**永远在同一事务**。任何「先改状态、之后异步补库存」的设计都会产生 INV-7 违反（状态与库存脱节）。
 

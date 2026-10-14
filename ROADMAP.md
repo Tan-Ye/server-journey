@@ -49,9 +49,9 @@
 | 天 | 时长 | 阶段 | 目标 | 产出物 |
 | --- | --- | --- | --- | --- |
 | D1 | 3h | 0 | 三条核心用例完整流程（下单/回调/超时取消） | `docs/01-usecases.md` |
-| D2 | 3h | 0 | 订单状态机：转移表 + 触发者 + 前置条件 + Mermaid 图 | `docs/state-machine.md` |
-| D3 | 3h | 0 | 8–12 个端点 API 契约 + 统一错误码规范 | `docs/02-api-contract.md` |
-| D4 | 3h | 0 | DoD 清单 + 难点初步方案假设 + 表字段草案 | `docs/03-dod.md` |
+| D2 | 3h | 0 | 订单状态机：转移表 + 触发者 + 前置条件 + Mermaid 图 | `docs/02-state-machine.md` |
+| D3 | 3h | 0 | 8–12 个端点 API 契约 + 统一错误码规范 | `docs/03-api-contract.md` |
+| D4 | 3h | 0 | DoD 清单 + 难点初步方案假设 + 表字段草案 | `docs/04-dod.md` |
 | D5 | 3h | 0 | 环境就绪：Docker Postgres+Redis、sqlx-cli、工具链、git init | `docker-compose.yml` |
 | D6 | 5h | 0→1① | 三 crate 骨架 + tracing + `GET /healthz`；随后重写错误层 | 首次 commit + 错误层雏形 |
 | D7 | 1h | — | 复盘 W1，敲定 W2 逐日 | `journal/W01.md` |

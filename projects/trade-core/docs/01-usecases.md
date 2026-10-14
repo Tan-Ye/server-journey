@@ -343,7 +343,7 @@
 3. 读取 `order_items.refund_from_status`（申请退款时记录的原状态）—— **撤销的终点不是固定状态，而是它**。
 4. **一个事务**内：
    - 条件更新 `orders.status` 回到 `refund_from_status`；
-   - 逐项 `order_items.refund_status = 'NONE'`、清空 `refund_shipped_at`；
+   - 逐项改写 `order_items.refund_status`：**钱未曾发出 → `'NONE'`；钱曾发出过（`refunds.status='SENT'`）→ `'REVOKED'`**；清空 `refund_shipped_at`；
    - `refunds.status = 'REVOKED'`；
    - **仅当原状态是 `PAID`**（货从未离仓）：**反向预占** `available -= n`、`reserved += n`（与申请退款时的归还是严格互逆的）。
 5. 提交后：更新 `order_status` 缓存；若支付方接口支持，尝试取消在途的退款请求。
@@ -360,9 +360,14 @@
 | B5 重复撤销 | 订单已不在 `REFUNDING` | `409 REFUND_NOT_REVOCABLE`，无副作用 |
 | B6 原状态是在途 | `refund_from_status='SHIPPED'` | 允许：回到 `SHIPPED`，货继续送往用户，**库存不动**（维持在 `in_transit`） |
 
-**数据变化**：`orders.status`（回到原状态）；`order_items.refund_status='NONE'`；`refunds.status='REVOKED'`；`stock` 仅在 B6 之外的回 `PAID` 场景反向预占。
+**数据变化**：`orders.status`（回到原状态）；`order_items.refund_status`（`'NONE'` 或 `'REVOKED'`，见第 4 步）；`refunds.status='REVOKED'`；`stock` 仅在回 `PAID` 的场景反向预占。
 
-**新增字段需求（交给 D4）**：`order_items.refund_from_status`（申请退款时的订单状态）与 `refunds.status` 增加 `REVOKED` 取值。**没有 `refund_from_status` 就无法实现撤销** —— 这是本用例对表结构提出的硬要求。
+**两个容易丢的事实**（必须落库，否则后面解释不清）：
+
+1. **撤销后仍要保留「钱曾发出过」**：若撤销前 `refunds.status` 已经是 `SENT`，则 `refund_status` 记 `'REVOKED'` 而不是 `'NONE'`，并打【需人工介入】#1。丢了它就会变成「系统认为没退过款，用户却收到了钱」。
+2. **撤销成功后允许重新申请退款**：`refund_status IN ('NONE','REVOKED')` 都可以作为再次申请的前置，否则用户撤销后就再也退不了了。
+
+**新增字段需求（交给 D4）**：`order_items.refund_from_status`（申请退款时的订单状态）、`order_items.refund_status` 需含 `REVOKED` 取值、`refunds.status` 需含 `PENDING` / `CREATED` / `SENT` / `SUCCESS` / `FAILED` / `REVOKED`。**没有 `refund_from_status` 就无法实现撤销** —— 这是本用例对表结构提出的硬要求。
 
 ---
 
@@ -418,13 +423,13 @@
 
 1. 在文档/代码注释中打上 **【需人工介入】** 标注；
 2. 系统行为统一为「**停在中间态 + 落库 + 告警**」，不猜着往下走；
-3. 完整清单见 `state-machine.md` 第 10 节（11 个场景，含撤销退款失败、退款重试超限、金额不符、延迟回调、退货超期未入库等）。
+3. 完整清单见 `02-state-machine.md` 第 10 节（11 个场景，含撤销退款失败、退款重试超限、金额不符、延迟回调、退货超期未入库等）。
 
 > 原则：猜错的代价（错退钱、错扣库存）远高于停在中间态让人来看一眼。这也是 `REFUNDING` 必须是**可长时间停留**的状态的原因 —— 它同时承载「正在退」「退失败等人看」「等退货入库」三种情形。
 
 ## 待 D2–D4 承接的问题
 
-1. **D2 状态机**：状态集合确定为 9 个 —— `PENDING_PAYMENT` / `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` / `REFUNDING` / `PARTIALLY_REFUNDED` / `REFUNDED` / `CANCELLED`（详见 `state-machine.md`，该文档是唯一真相源），每个转移的触发者与前置条件直接取自本文各用例的分支表。
+1. **D2 状态机**：状态集合确定为 9 个 —— `PENDING_PAYMENT` / `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` / `REFUNDING` / `PARTIALLY_REFUNDED` / `REFUNDED` / `CANCELLED`（详见 `02-state-machine.md`，该文档是唯一真相源），每个转移的触发者与前置条件直接取自本文各用例的分支表。
 2. **D3 API 契约**：直接以 §0「路由约定」的 16 个端点清单为输入，逐个补请求/响应 schema 与状态码。需特别覆盖：
    - 错误码：`STOCK_INSUFFICIENT`、`IDEMPOTENCY_KEY_REUSED`、`IDEMPOTENCY_IN_PROGRESS`、`PRODUCT_OFF_SALE`、`ORDER_NOT_CANCELLABLE`、`ORDER_NOT_REFUNDABLE`、`REFUND_ALREADY_REQUESTED`、`REFUND_ALREADY_SENT`、`REFUND_NOT_REVOCABLE_SIGNED`、`REFUND_REVOKE_STOCK_UNAVAILABLE`、`RETURN_ALREADY_RECEIVED`、`PARTIAL_REFUND_NOT_SUPPORTED`、`INVALID_STATE_TRANSITION`、`VALIDATION_ERROR`
    - 统一响应包体与错误结构（D6 的错误层雏形要跟它对齐）；错误结构需能承载【需人工介入】标记
