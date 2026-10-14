@@ -1,0 +1,27 @@
+# 换行与编码约定
+#
+# 背景：本仓库的校验脚本 tools/validate.ps1 运行时用的是 Windows PowerShell 5.1。
+# 5.1 对「没有 BOM 的 UTF-8 脚本」会按 ANSI(GBK) 解析 —— 脚本里的中文提示与
+# 中文正则全部乱码，校验结果不可信（这个坑已经踩过一次）。
+#
+# 因此 validate.ps1 的 UTF-8 BOM 是被依赖的一部分，不能丢：
+#   - 这里声明为 text，让 git 正常做换行归一化，但不要加 -text（那会变成二进制处理）
+#   - 若某次 checkout 后脚本报「中文乱码 / 语法错误」，先检查 BOM 是否还在：
+#       Format-Hex tools\validate.ps1 | Select-Object -First 1
+#     期望开头是 EF BB BF。丢了就补回来：
+#       $t=[IO.File]::ReadAllText($p,[Text.UTF8Encoding]::new($false))
+#       [IO.File]::WriteAllText($p,$t,[Text.UTF8Encoding]::new($true))
+#
+# 文档与代码统一用 LF，避免 diff 里出现整文件级噪声。
+
+* text=auto eol=lf
+
+# PowerShell 脚本保持 BOM（显式写出，防止将来有人加 *.ps1 text 把 BOM 处理掉）
+*.ps1 text eol=lf
+
+# 二进制资源不做归一化
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
