@@ -201,12 +201,18 @@ available + reserved + in_transit + damaged + sold = total_inbound
 ```sql
 SELECT COALESCE(SUM(oi.quantity), 0) FROM order_items oi
 JOIN orders o ON o.id = oi.order_id
-WHERE oi.product_id = $1 AND o.status IN ('DELIVERED','COMPLETED','REFUNDING','REFUNDED');
+WHERE oi.product_id = $1 AND o.status IN ('DELIVERED', 'COMPLETED');
 ```
+
+> **为什么只算 `DELIVERED` / `COMPLETED`，不加 `REFUNDING` / `REFUNDED`**：`DELIVERED` 只能由 `SHIPPED` 经 T9 到达，而一旦申请退款（T10）订单就变成 `REFUNDING`，此后签收动作的 `WHERE status='SHIPPED'` **不再命中**，订单会直接走 T14 到 `REFUNDED`。**所以 `REFUNDING` / `REFUNDED` 的订单永远不会是已签收态**，它们的货从未交付用户。
+>
+> 把它们算进 `sold` 会**虚增已售数量**，等式右边被撑大，对账就查不出真正的差额 —— 这个错误很隐蔽，因为状态名看起来「都跟已发货有关」。
+>
+> **等价的数据判据**：`order_items.delivered_at IS NOT NULL`。两者应一致；若不一致，说明 T9 的库存动作与状态变更脱节了（违反 INV-7）。
 
 > **为什么 `sold` 要算进来**：正向签收后货已交付用户、**离开四栏**，四栏之和必然小于 `total_inbound`，差额就是已售出。所以对账等式必须含 `sold`，单看四栏会误判为「库存丢了」。
 >
-> **退货的两面**：退货包裹入库时 `in_transit → available`（四栏之和不变），而 `total_inbound` **也不变** —— 货本来就在账上，只是从「已售出」回到「可售」。这是 v1 的简化：`sold` 会因此变小，对账恒等式仍成立。
+> **等式为什么恒成立**（逐条转移核对）：正向签收 `in_transit -= n、sold += n`（左侧不变）；退货入库 `in_transit -= n、available += n、sold -= n`（左侧不变，`total_inbound` 也不变 —— 货本来就在账上，只是从「已售出」回到「可售」）。两侧从不单独变动，所以任何时刻等式都成立。
 
 ### 3.5 `payments` —— 支付流水
 

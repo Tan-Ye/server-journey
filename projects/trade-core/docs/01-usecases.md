@@ -48,7 +48,7 @@
 | ID | 不变量 | 对应 |
 | --- | --- | --- |
 | INV-1 | `available` / `reserved` / `in_transit` / `damaged` **四栏均 `>= 0`** | DoD #1 |
-| INV-2 | **库存两侧相等**：`available + reserved + in_transit + damaged + sold = total_inbound`。`sold` = 已经正向签收、交付给用户的件数（货离开了四栏，但账还在）。只对四栏求和会误判为「库存丢了」 | 对账 |
+| INV-2 | **库存两侧相等**：`available + reserved + in_transit + damaged + sold = total_inbound`。`sold` = 已经正向签收、交付给用户的件数，**判据是订单处于 `DELIVERED` / `COMPLETED`**（`REFUNDING` / `REFUNDED` 的货从未交付用户，**不计入**）。只对四栏求和会误判为「库存丢了」 | 对账 |
 | INV-3 | 同一 `Idempotency-Key` 只对应一笔订单 | DoD #2 |
 | INV-4 | 同一 `payment_event` 只被消费一次 | DoD #3 |
 | INV-5 | 订单状态只能沿状态机合法边转移，且**每个事件只生效一次** | DoD #3 |
