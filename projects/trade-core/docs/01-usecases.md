@@ -52,7 +52,7 @@
 | 资源型路径 | 集合 `GET /orders`、单体 `GET /orders/{id}` |
 | 路径分段 | 全小写 + 中划线（`return-received`），无版本前缀（v1 由部署环境承担） |
 
-**最终端点清单（15 个，作为 D3 的输入）**
+**最终端点清单（16 个，作为 D3 的输入）**
 
 | # | 方法与路径 | 归属 | 说明 |
 | --- | --- | --- | --- |
@@ -61,16 +61,17 @@
 | 3 | `GET /orders/{id}` | 用户 | 订单详情 |
 | 4 | `POST /orders/cancel/{id}` | 用户 | 取消未支付订单 |
 | 5 | `POST /orders/refund/{id}` | 用户 | 申请退款（v1 整单退） |
-| 6 | `GET /products` | 商品 | 商品列表 |
-| 7 | `GET /products/{id}` | 商品 | 商品详情 |
-| 8 | `POST /payments/pay/{order_id}` | 支付 | 发起支付，返回支付方所需参数 |
-| 9 | `POST /payments/callback/{provider}` | 支付 | 支付方回调（验签 + 幂等） |
-| 10 | `POST /payments/mock-success/{order_id}` | 支付 | 开发环境模拟支付成功（可砍） |
-| 11 | `POST /admin/orders/ship/{id}` | 管理 | 手动发货 |
-| 12 | `POST /admin/orders/deliver/{id}` | 管理 | 手动签收 |
-| 13 | `POST /admin/orders/return-received/{id}` | 管理 | 手动确认退货包裹入库 |
-| 14 | `GET /admin/orders` | 管理 | 按状态筛选订单，`REFUNDING` 队列靠它 |
-| 15 | `GET /healthz` | 运维 | 存活探测（D6 实现） |
+| 6 | `POST /orders/refund-revoke/{id}` | 用户 | 撤销退款申请（仅钱未退、货未到仓） |
+| 7 | `GET /products` | 商品 | 商品列表 |
+| 8 | `GET /products/{id}` | 商品 | 商品详情 |
+| 9 | `POST /payments/pay/{order_id}` | 支付 | 发起支付，返回支付方所需参数 |
+| 10 | `POST /payments/callback/{provider}` | 支付 | 支付方回调（验签 + 幂等） |
+| 11 | `POST /payments/mock-success/{order_id}` | 支付 | 开发环境模拟支付成功（可砍） |
+| 12 | `POST /admin/orders/ship/{id}` | 管理 | 手动发货 |
+| 13 | `POST /admin/orders/deliver/{id}` | 管理 | 手动签收 |
+| 14 | `POST /admin/orders/return-received/{id}` | 管理 | 手动确认退货包裹入库 |
+| 15 | `GET /admin/orders` | 管理 | 按状态筛选订单，`REFUNDING` 队列靠它 |
+| 16 | `GET /healthz` | 运维 | 存活探测（D6 实现） |
 
 ### 术语
 
@@ -322,6 +323,49 @@
 
 ---
 
+## 用例 6 · 撤销退款申请（Revoke Refund）
+
+**目标**：用户在退款还没真正发生时反悔，把订单退回申请退款之前的状态。这是 `REFUNDING` 唯一的「往回走」的出口。
+
+**触发者**：用户 `POST /orders/refund-revoke/{id}`（或客服代操作）。
+
+**前置条件**（两条硬条件，缺一不可）
+
+| 条件 | 判定依据 | 理由 |
+| --- | --- | --- |
+| **钱还没退出去** | `refunds.status IN ('PENDING','CREATED')` | 钱一旦退出（`SENT`），撤销就变成「再收一次钱」——【需人工介入】，系统不做 |
+| **货没到仓** | 全部 `order_items.return_received_at IS NULL` | 货已入库，撤销要重新出库，库存语义与实物位置会脱节 |
+
+**主流程**
+
+1. 读取订单，确认状态为 `REFUNDING`（或整单场景下的 `PARTIALLY_REFUNDED`）。
+2. 校验上面两条硬条件；不满足则返回 409 并打【需人工介入】标注。
+3. 读取 `order_items.refund_from_status`（申请退款时记录的原状态）—— **撤销的终点不是固定状态，而是它**。
+4. **一个事务**内：
+   - 条件更新 `orders.status` 回到 `refund_from_status`；
+   - 逐项 `order_items.refund_status = 'NONE'`、清空 `refund_shipped_at`；
+   - `refunds.status = 'REVOKED'`；
+   - **仅当原状态是 `PAID`**（货从未离仓）：**反向预占** `available -= n`、`reserved += n`（与申请退款时的归还是严格互逆的）。
+5. 提交后：更新 `order_status` 缓存；若支付方接口支持，尝试取消在途的退款请求。
+6. 返回 `200` + 恢复后的订单状态。
+
+**异常 / 分支流程**
+
+| 分支 | 条件 | 处理 |
+| --- | --- | --- |
+| B1 钱已退出 | `refunds.status='SENT'` | 拒绝 `409 REFUND_ALREADY_SENT` +【需人工介入】#1 |
+| B2 货已到仓 | 存在 `return_received_at` | 拒绝 `409 RETURN_ALREADY_RECEIVED` +【需人工介入】 |
+| B3 原状态是已签收 | `refund_from_status IN ('DELIVERED','COMPLETED')` | **不允许撤销** `409 REFUND_NOT_REVOCABLE_SIGNED` +【需人工介入】#8（货已在用户手上，退货动作已发生） |
+| B4 反向预占失败 | 原状态是 `PAID`，但 `available < n`（库存已被别人买走） | **整个撤销回滚**，订单保持 `REFUNDING`，`409 REFUND_REVOKE_STOCK_UNAVAILABLE` +【需人工介入】#7。绝不允许把 `available` 扣成负数（INV-1），也不允许「状态退了但库存没退」 |
+| B5 重复撤销 | 订单已不在 `REFUNDING` | `409 REFUND_NOT_REVOCABLE`，无副作用 |
+| B6 原状态是在途 | `refund_from_status='SHIPPED'` | 允许：回到 `SHIPPED`，货继续送往用户，**库存不动**（维持在 `in_transit`） |
+
+**数据变化**：`orders.status`（回到原状态）；`order_items.refund_status='NONE'`；`refunds.status='REVOKED'`；`stock` 仅在 B6 之外的回 `PAID` 场景反向预占。
+
+**新增字段需求（交给 D4）**：`order_items.refund_from_status`（申请退款时的订单状态）与 `refunds.status` 增加 `REVOKED` 取值。**没有 `refund_from_status` 就无法实现撤销** —— 这是本用例对表结构提出的硬要求。
+
+---
+
 ## 三条关键语义的收口
 
 | 语义 | 触发点 | 库存动作 |
@@ -346,6 +390,8 @@
 | 两种幂等机制混淆 | 以为是同一回事 | `Idempotency-Key` 管用户请求重复，`event_id` 管支付方通知重复，不同表、不同生命周期 |
 | 多实例调度器 | 两个实例同时推进同一订单 | 所有状态推进都是条件更新，不依赖进程内锁 |
 | 扫描周期 5 min 的精度 | 超时取消的**兜底路径**最坏晚 5 min 生效；自动签收启动时最多晚 5 min 触发 | 超时取消的**主通道是延迟队列**（秒级精度），扫描只是兜底，5 min 的偏差可接受；自动签收本身只需天内精度 |
+| 撤销退款 vs 退款回调 | 用户点撤销的同时支付方回了 `REFUND_SUCCESS` | 两条都是条件更新：撤销要 `refunds.status IN ('PENDING','CREATED')`，回调要 `status='REFUNDING'`。**钱的状态由 `refunds.status` 定唯一赢家**，撤销赢则回调落 `IGNORED`（钱其实已退，进【需人工介入】） |
+| 撤销退款的反向预占 | 撤销时货已被别人买走，`available < n` | 整个撤销回滚，订单保持 `REFUNDING`，返回 409。**不允许把 available 扣成负数，也不允许「状态退了库存没退」** |
 
 ## 实现范围
 
@@ -356,6 +402,7 @@
 - 用例 3（超时取消 + 扫描兜底）
 - 用例 4（自动发货 3 天签收 + 手动发货/签收端点）
 - 用例 5 的**第 1 路与第 3 路**（发货前退款、已签收退款；用 Admin 端点模拟退货签收）
+- 用例 6（撤销退款申请，含反向预占与失败回滚）
 
 **已设计、本阶段不实现**
 
@@ -363,13 +410,28 @@
 - 第 2 路的真实拦截 API（v1 只记 `intercept_requested_at`）
 - 部分退货（数据模型已按订单项设计，放开只需删掉一条校验）
 - 售后退款之外的逆向场景（换货、维修）
+- **一切人工介入功能** —— 没有工单、没有审批流、没有人工改状态的接口（见下）
+
+## 【需人工介入】标注约定
+
+**本项目不实现任何人工介入功能。** 凡系统无法自动得出唯一正确结果的情形，一律：
+
+1. 在文档/代码注释中打上 **【需人工介入】** 标注；
+2. 系统行为统一为「**停在中间态 + 落库 + 告警**」，不猜着往下走；
+3. 完整清单见 `state-machine.md` 第 10 节（11 个场景，含撤销退款失败、退款重试超限、金额不符、延迟回调、退货超期未入库等）。
+
+> 原则：猜错的代价（错退钱、错扣库存）远高于停在中间态让人来看一眼。这也是 `REFUNDING` 必须是**可长时间停留**的状态的原因 —— 它同时承载「正在退」「退失败等人看」「等退货入库」三种情形。
 
 ## 待 D2–D4 承接的问题
 
 1. **D2 状态机**：状态集合确定为 9 个 —— `PENDING_PAYMENT` / `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` / `REFUNDING` / `PARTIALLY_REFUNDED` / `REFUNDED` / `CANCELLED`（详见 `state-machine.md`，该文档是唯一真相源），每个转移的触发者与前置条件直接取自本文各用例的分支表。
-2. **D3 API 契约**：直接以 §0「路由约定」的 15 个端点清单为输入，逐个补请求/响应 schema 与状态码。需特别覆盖：
-   - 错误码：`STOCK_INSUFFICIENT`、`IDEMPOTENCY_KEY_REUSED`、`IDEMPOTENCY_IN_PROGRESS`、`PRODUCT_OFF_SALE`、`ORDER_NOT_REFUNDABLE`、`REFUND_ALREADY_REQUESTED`、`PARTIAL_REFUND_NOT_SUPPORTED`、`VALIDATION_ERROR`
-   - 统一响应包体与错误结构（D6 的错误层雏形要跟它对齐）
-   - 15 个略超 8–12 的要求，若需精简优先砍 #10 `mock-success`（开发便利，可用手动拨表替代）与 #14 `admin/orders`（可先只留 `REFUNDING` 筛选）
-3. **D4 表字段草案**：至少 7 张表 —— `orders` / `order_items` / `stock` / `payments` / `payment_events` / `refunds` / `idempotency_keys`。
-4. **待定**：`COMPLETED_AFTER_DAYS`（自动确认收货，默认 7 天）与退货窗口 N 天的取值；`damaged` 库存的处置流程（v1 只记账不处理）。
+2. **D3 API 契约**：直接以 §0「路由约定」的 16 个端点清单为输入，逐个补请求/响应 schema 与状态码。需特别覆盖：
+   - 错误码：`STOCK_INSUFFICIENT`、`IDEMPOTENCY_KEY_REUSED`、`IDEMPOTENCY_IN_PROGRESS`、`PRODUCT_OFF_SALE`、`ORDER_NOT_CANCELLABLE`、`ORDER_NOT_REFUNDABLE`、`REFUND_ALREADY_REQUESTED`、`REFUND_ALREADY_SENT`、`REFUND_NOT_REVOCABLE_SIGNED`、`REFUND_REVOKE_STOCK_UNAVAILABLE`、`RETURN_ALREADY_RECEIVED`、`PARTIAL_REFUND_NOT_SUPPORTED`、`INVALID_STATE_TRANSITION`、`VALIDATION_ERROR`
+   - 统一响应包体与错误结构（D6 的错误层雏形要跟它对齐）；错误结构需能承载【需人工介入】标记
+   - 16 个略超 8–12 的要求，若需精简优先砍 #11 `mock-success`（开发便利，可用手动拨表替代）与 #15 `admin/orders`（可先只留 `REFUNDING` 筛选）
+3. **D4 表字段草案**：至少 7 张表 —— `orders` / `order_items` / `stock` / `payments` / `payment_events` / `refunds` / `idempotency_keys`。新增硬要求：
+   - `order_items.refund_from_status`（**撤销退款必需**，不记就无法回到原状态）
+   - `order_items.refund_shipped_at` / `return_received_at` / `return_condition`
+   - `refunds.status` 需含 `PENDING` / `CREATED` / `SENT` / `SUCCESS` / `FAILED` / `REVOKED`（撤销判定依赖 `SENT` 这个区分）
+   - `orders.auto_ship_at` / `expected_delivered_at`（调度器拨表用）
+4. **待定**：`COMPLETED_AFTER_DAYS`（自动确认收货，默认 7 天）、`AUTO_RETURN_DAYS`（退货入库超期，建议 15 天）、`MAX_REFUND_RETRY`（建议 5 次）的取值；`damaged` 库存的处置（v1 只记账 + 打【需人工介入】标注）。
