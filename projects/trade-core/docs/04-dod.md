@@ -152,17 +152,42 @@
 
 **索引**：`(order_id)`；部分索引 `(order_id) WHERE refund_status <> 'NONE'`（退款排查用）。
 
-### 3.4 `stock` —— 库存（**一商品一行，与订单无从属关系**）
+### 3.4 `stock` —— 库存（**一行 = 一个商品的聚合值**）
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
 | `product_id` | `BIGINT PK REFERENCES products(id) ON DELETE RESTRICT` | **主键就是商品 ID** —— 一个商品只有一行库存 |
-| `available` | `INT NOT NULL` | 可售 |
-| `reserved` | `INT NOT NULL` | 已售未发 |
-| `in_transit` | `INT NOT NULL` | 已发未签收（**退货包裹在途也算这里**） |
-| `damaged` | `INT NOT NULL` | 验货不合格，不可售 |
+| `available` | `INT NOT NULL` | **没被任何订单占用的件数**。这是唯一不依赖订单的一栏 |
+| `reserved` | `INT NOT NULL` | **被「未发货订单」占用的件数汇总** —— 所有处于 `PENDING_PAYMENT` / `PAID` 的订单项数量之和。**不代表某个订单买了多少** |
+| `in_transit` | `INT NOT NULL` | **属于「已发货订单」的件数汇总**（正向在途、在驿站；**退货包裹在途也算这里**）。不等于「某个订单发了多少」 |
+| `damaged` | `INT NOT NULL` | 验货不合格的件数汇总，不可售 |
 | `total_inbound` | `INT NOT NULL` | **累计入库总量** —— 该商品历史上共有多少件进入过仓库，由种子数据或人工入库设定 |
 | `sold` | **派生值，不建列** | 已正向签收交付用户的件数。由订单聚合得出（见下方 SQL），**不落库** —— 落库就要跟订单状态保持同步，属于重复真相源 |
+
+#### 为什么这里只有聚合值，而「订单下的商品状态」不在本表
+
+**必须分清两个不同的问题**，它们由不同的表回答：
+
+| 问题 | 答案在哪 |
+| --- | --- |
+| 「这个商品还有多少能卖？」 | 本表 `available`（**聚合**） |
+| 「A 订单的货发了没？」 | `orders.status` + `order_items`（**订单域，不在本表**） |
+| 「总共多少件被订单占着还没发？」 | 本表 `reserved`（**聚合**） |
+
+**`reserved = 3` 的正确读法是**：这 3 件分摊在若干订单上 —— 可能 1 个订单买了 3 件，也可能 3 个订单各买 1 件。**绝不可读成「这个商品售出了 3 件」**，那样就抹掉了订单之间的差异。
+
+**「某个商品在某个订单下是什么状态」= 该订单项所属订单的 `orders.status`**：
+
+| 某订单项的订单状态 | 该订单项的货在库存里的位置 |
+| --- | --- |
+| `PENDING_PAYMENT` / `PAID` | 计入 `stock.reserved` |
+| `SHIPPED` | 计入 `stock.in_transit` |
+| `DELIVERED` / `COMPLETED` | **不在四栏**（已交付用户，计入 `sold`） |
+| `REFUNDING` / `PARTIALLY_REFUNDED`（货未离仓） | 已回到 `stock.available` |
+| `REFUNDING`（货在途/在用户手上） | 维持在 `stock.in_transit` |
+| `CANCELLED` | 已回到 `stock.available` |
+
+> **这正是 INV-7 的意义**：本表的四栏必须与订单状态保持一致。任何一边动了另一边没动，账就不平。所以 `stock` 的更新**永远与订单状态变更在同一事务内**完成。
 
 **约束（关键）**：`CHECK (available >= 0)`、`CHECK (reserved >= 0)`、`CHECK (in_transit >= 0)`、`CHECK (damaged >= 0)` —— **让数据库自己兜住 INV-1**，应用层漏判也扣不出负数。
 **`total_inbound` 的语义与对账**：它是**资产基线**，等于「还在我方手里的 + 已经卖出去的」：
