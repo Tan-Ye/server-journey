@@ -366,7 +366,7 @@
 
 ## 待 D2–D4 承接的问题
 
-1. **D2 状态机**：状态集合确定为 `PENDING_PAYMENT` / `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` / `REFUNDING` / `REFUNDED` / `CANCELLED`（8 个），需为每个转移标注触发者与前置条件 —— 直接取自本文各用例的分支表。
+1. **D2 状态机**：状态集合确定为 9 个 —— `PENDING_PAYMENT` / `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` / `REFUNDING` / `PARTIALLY_REFUNDED` / `REFUNDED` / `CANCELLED`（详见 `state-machine.md`，该文档是唯一真相源），每个转移的触发者与前置条件直接取自本文各用例的分支表。
 2. **D3 API 契约**：直接以 §0「路由约定」的 15 个端点清单为输入，逐个补请求/响应 schema 与状态码。需特别覆盖：
    - 错误码：`STOCK_INSUFFICIENT`、`IDEMPOTENCY_KEY_REUSED`、`IDEMPOTENCY_IN_PROGRESS`、`PRODUCT_OFF_SALE`、`ORDER_NOT_REFUNDABLE`、`REFUND_ALREADY_REQUESTED`、`PARTIAL_REFUND_NOT_SUPPORTED`、`VALIDATION_ERROR`
    - 统一响应包体与错误结构（D6 的错误层雏形要跟它对齐）
