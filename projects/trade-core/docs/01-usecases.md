@@ -137,13 +137,18 @@
 **主流程**（顺序即实现顺序）
 
 1. 支付方发起通知（可能重复、乱序、延迟）。
-2. **验签**：失败 → 4xx，**不落任何业务数据**（只记安全日志）。
+2. **验签**：失败 → `401 INVALID_SIGNATURE`，**不落任何业务数据**（只记安全日志 + 告警）。这是回调唯一返回非 200 的情形。
 3. **事件去重**：`INSERT ... ON CONFLICT DO NOTHING` 写 `payment_events(event_id)`。冲突（已处理过）→ 返回 200，**状态零流转**（DoD #3 核心）。
 4. 读订单当前状态与 `total_amount`。
 5. **合法性 + 金额校验**：金额不符 → 落 `AMOUNT_MISMATCH`，不流转，告警；目标状态与当前矛盾 → 落 `IGNORED`，不流转。
-6. **一个事务**内：`UPDATE orders SET status='PAID', paid_at=now() WHERE id=? AND status='PENDING_PAYMENT'`（影响行数须为 1）；写 `payments`；`payment_events` 置 `PROCESSED`。
-7. 提交后：更新 `order_status:{order_id}`；**从延迟队列移除该订单**（防止已支付订单被超时取消）。
+6. **一个事务内按 `result` 分三种条件更新**（全部要求影响行数 = 1，否则走第 5 步的「不流转」路径）：
+   - `PAY_SUCCESS`：`SET status='PAID', paid_at=now() WHERE status='PENDING_PAYMENT'`，写 `payments`；
+   - `PAY_FAILED`：`SET status='CANCELLED', cancel_reason='PAY_FAILED' WHERE status='PENDING_PAYMENT'`，**同事务归还库存**（`reserved → available`）；
+   - `REFUND_SUCCESS`：`SET status='REFUNDED' WHERE status='REFUNDING'`（或按是否还有在途退货项落 `PARTIALLY_REFUNDED`，见 `02-state-machine.md` T14/T14a），更新 `refunds.status`。
+   - 三种都需把 `payment_events` 置 `PROCESSED`。
+7. 提交后：更新 `order_status:{order_id}`；**从延迟队列移除该订单**（防止已支付订单被超时取消）。`PAY_FAILED` 分支同样要移出队列。
 8. 返回 200 + 支付方要求的响应体（如 `{"code":"SUCCESS"}`）。**必须同步提交事务后才返回** —— 先返回再异步处理，进程崩溃会丢回调且支付方不再重推。
+9. **只有 `PAY_SUCCESS` 才进入发货推进**（下面的两条路径）；`PAY_FAILED` / `REFUND_SUCCESS` 到此结束。
 
 **发货推进（两条路径，行为必须完全一致）**
 
@@ -156,12 +161,12 @@
 | 分支 | 条件 | 处理 |
 | --- | --- | --- |
 | B1 重复回调 | 同一 `event_id` 第 2…50 次 | 第 3 步拦下，返回 200，零流转（DoD #3） |
-| B2 延迟回调 | 订单已被超时取消后才补付成功 | 终态不可变（INV-6），落 `IGNORED(LATE_CALLBACK)`，进人工退款流程 + 告警 |
+| B2 延迟回调 | 订单已被超时取消后才补付成功 | 终态不可变（INV-6），落 `IGNORED(LATE_CALLBACK)`，**打【需人工介入】#4 标注** + 告警（钱已收但订单已取消，需原路退给用户） |
 | B3 乱序回调 | `PAY_FAILED` 与 `PAY_SUCCESS` 先后颠倒 | 各自独立判断，只接受与当前状态相容的那个，不相容落 `IGNORED` |
 | B4 支付失败 | `result = PAY_FAILED` | `PENDING_PAYMENT → CANCELLED`，**同事务归还库存**（`reserved → available`），移出延迟队列 |
 | B5 退款回调 | `result = REFUND_SUCCESS` | 允许从 `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` 进入；库存动作**不在这里做**（见用例 5） |
-| B6 验签失败 | 签名不匹配 | 401/403，不落业务数据，安全日志 + 告警 |
-| B7 金额不符 | `amount != total_amount` | 不流转，落 `AMOUNT_MISMATCH`，告警 |
+| B6 验签失败 | 签名不匹配 | `401 INVALID_SIGNATURE`，不落业务数据，安全日志 + 告警 |
+| B7 金额不符 | `amount != total_amount` | 不流转，落 `AMOUNT_MISMATCH`，**打【需人工介入】#3 标注**，告警。**对支付方仍返回 200** |
 | B8 订单不存在 | 查无此单 | 返回 200 + 落 `UNKNOWN_ORDER`（避免支付方无限重推），告警 |
 | B9 并发重复投递 | 同一 `event_id` 两个请求同时在飞 | 唯一约束 + 条件更新双保险，只有一个能改到 `PENDING_PAYMENT` 的那一行 |
 | B10 发货时状态已变 | 发货前订单被退款/取消 | 条件更新影响行数 = 0，静默退出，不重复扣库存 |
@@ -203,8 +208,8 @@
 | B2 已支付 | 用户在 29:59 完成支付 | 影响行数 = 0，不做任何事（与用例 2 第 7 步移出队列形成双保险） |
 | B3 服务重启 | 队列任务丢失 | 扫描兜底捞出到期订单处理（DoD #4） |
 | B4 归还失败 | 数据库错误 | 事务回滚，订单保持 `PENDING_PAYMENT`，下次重试（保证 E） |
-| B5 订单不存在 | 无效 `order_id` | 404 或日志忽略 + 告警 |
-| B6 非本人取消 | 取消他人订单 | 403，不流转 |
+| B5 订单不存在 | 无效 `order_id` | `404 ORDER_NOT_FOUND` |
+| B6 非本人取消 | 取消他人订单 | **`404 ORDER_NOT_FOUND`**（与「不存在」不区分，避免通过响应差异探测他人订单是否存在；见 `03-api-contract.md` §8.1） |
 
 **数据变化**：`orders` → `CANCELLED`（`cancelled_at` / `cancel_reason`）；`stock` `reserved → available`；Redis 缓存与延迟队列。
 
@@ -287,18 +292,18 @@
 
 **第 2 路：`SHIPPED`（已发货、未签收）—— 货在路上**
 
-1. 条件更新 `WHERE id=? AND status='SHIPPED'` → `REFUNDING`。
-2. 同一事务：**库存完全不动**。货在途，此刻加回 `available` 会制造「显示有货、实际发不出」的新式超卖。记录 `order_items.refund_shipped_at = now()` 以备对账。
+1. 条件更新 `UPDATE orders SET status='REFUNDING', refund_requested_at=now() WHERE id=? AND status='SHIPPED'`。
+2. 同一事务：**库存完全不动**。货在途，此刻加回 `available` 会制造「显示有货、实际发不出」的新式超卖。逐项记 `refund_from_status='SHIPPED'`、`refund_shipped_at = now()` 以备对账。
 3. 尝试拦截（v1 只记录 `intercept_requested_at`，不接真实物流 API；开发环境等同拦截失败）。
 4. 拦截失败则包裹照常送达，用户拒收或退回；包裹回到仓库签收时才动库存。
-5. 退款走支付方流程，`REFUND_SUCCESS` 后订单入 `REFUNDED`。
+5. 退款走支付方流程，`REFUND_SUCCESS` 后：若无在途退货项 → `REFUNDED`；若货仍在途 → `PARTIALLY_REFUNDED`（见 `02-state-machine.md` T14/T14a）。
 6. **签收时刻的库存动作**（`REFUNDED` 之后仍可能发生）：货到仓即走**用例 4 · 签收动作第 4 步的逆向分支** —— `in_transit -= n`，验货合格 `available += n`、不合格 `damaged += n`。判定轴是**订单状态**（`REFUNDED` → 逆向），不是触发源；这条与第 3 路共用同一份入库逻辑。
 
 **第 3 路：`DELIVERED` / `COMPLETED`（已签收）—— 货在用户手上**
 
-1. 条件更新 `WHERE id=? AND status IN ('DELIVERED','COMPLETED')` → `REFUNDING`，记 `refund_requested_at`。
-2. 同一事务：写 `refunds`、逐项 `refund_status='REFUNDING'`。**库存不动** —— 货在用户手上。
-3. 用户在 N 天内寄回（v1 不接逆向物流，开发环境用 `POST /admin/orders/return-received/{id}` 手动触发，或调度器在 `AUTO_RETURN_DAYS` 后自动触发）。
+1. 条件更新 `UPDATE orders SET status='REFUNDING', refund_requested_at=now() WHERE id=? AND status IN ('DELIVERED','COMPLETED')`。
+2. 同一事务：写 `refunds`、逐项 `refund_status='REFUNDING'` 与 `refund_from_status`（`DELIVERED` 或 `COMPLETED`）。**库存不动** —— 货在用户手上。
+3. 用户在 `AUTO_RETURN_DAYS`（默认 15 天）内寄回（v1 不接逆向物流，开发环境用 `POST /admin/orders/return-received/{id}` 手动触发）。**超期未寄回不自动退款** —— 打【需人工介入】#5 标注并告警（见 B8）。
 4. 退货包裹回到仓库签收：`stock` `in_transit -= n`，验货合格 → `available += n`；不合格 → `damaged += n`；逐项写 `return_received_at`、`return_condition = GOOD | DAMAGED`。
 5. 订单入 `REFUNDED`（若第 3 步已入则保持），终态不可再变。
 
@@ -306,20 +311,20 @@
 
 | 分支 | 条件 | 处理 |
 | --- | --- | --- |
-| B1 重复申请 | 同一订单再点一次退款 | `refund_status != NONE` → `409 REFUND_ALREADY_REQUESTED`，**不重复退款、不重复归还库存** |
+| B1 重复申请 | 同一订单再点一次退款 | 已有在途退款（`REFUNDING` / `PARTIALLY_REFUNDED`）→ `409 REFUND_ALREADY_REQUESTED`；已退完款（`REFUNDED`）→ `409 ORDER_ALREADY_FINAL`。**注意 `REVOKED` 不拦** —— 撤销过的订单允许重新申请 |
 | B2 多商品订单 | items > 1 | v1 强制整单退；若请求只带了部分项 → `400 PARTIAL_REFUND_NOT_SUPPORTED`（明确告知而非静默忽略） |
 | B3 并发：退款申请 vs 自动签收 | 用户点退款时签收任务同时命中 | 两个条件更新的 `WHERE status` 只有一个能赢；输的一方静默退出。**赢的是谁都能自洽**：签收赢 → 走第 3 路；退款赢 → 走第 2 路 |
 | B4 验货不合格 | 退回的商品有损坏 | 库存进 `damaged`（不参与可售），订单仍 `REFUNDED`（钱照退，货损另行处理） |
 | B5 退款失败 | 支付方退款 API 报错 | `refunds.status = 'FAILED'`，订单**保持 `REFUNDING`**，可重试；不得提前入 `REFUNDED` |
 | B6 订单已被取消 | 申请退款时是 `CANCELLED` | `409 ORDER_NOT_REFUNDABLE`（钱没收到，无可退） |
 | B7 商品已删除 | 商品下架/被删 | 用 `order_items` 的价格与数量快照计算退款额，不依赖商品表 |
-| B8 退货包裹丢失 | 超期未签收 | 保持 `REFUNDING`，进人工处理队列并告警（v1 只告警不自动处理） |
+| B8 退货包裹丢失 | 超期未签收（超 `AUTO_RETURN_DAYS`） | 保持 `REFUNDING`，**打【需人工介入】#5 标注**并告警（v1 只告警不自动处理） |
 
 **数据变化**
 
 - `refunds`：+1（含 `status` / `amount` / `provider_refund_id`）
 - `orders`：`status` / `refund_requested_at` / `cancelled_at`（第 1 路）
-- `order_items`：`refund_status` / `refund_shipped_at` / `return_received_at` / `return_condition`
+- `order_items`：`refund_status` / `refund_from_status`（**申请时就要写，撤销靠它回退**） / `refund_shipped_at` / `return_received_at` / `return_condition`
 - `stock`：第 1 路 `reserved → available`；第 2、3 路的归还**发生在包裹签收时刻**，`in_transit → available | damaged`
 - Redis：`order_status:{order_id}`；延迟队列增删
 
@@ -337,10 +342,11 @@
 | --- | --- | --- |
 | **钱还没退出去** | `refunds.status IN ('PENDING','CREATED')` | 钱一旦退出（`SENT`），撤销就变成「再收一次钱」——【需人工介入】，系统不做 |
 | **货没到仓** | 全部 `order_items.return_received_at IS NULL` | 货已入库，撤销要重新出库，库存语义与实物位置会脱节 |
+| **申请时订单不是已签收态** | `refund_from_status NOT IN ('DELIVERED','COMPLETED')` | 已签收说明退货动作已经发生，不允许撤销（`409 REFUND_NOT_REVOCABLE_SIGNED`） |
 
 **主流程**
 
-1. 读取订单，确认状态为 `REFUNDING`（或整单场景下的 `PARTIALLY_REFUNDED`）。
+1. 读取订单，确认状态为 `REFUNDING`（v1 只支持这一种 —— `PARTIALLY_REFUNDED` 的撤销边 T18b 已画出，但 v1 因强制整单退而不会进入该状态）。
 2. 校验上面两条硬条件；不满足则返回 409 并打【需人工介入】标注。
 3. 读取 `order_items.refund_from_status`（申请退款时记录的原状态）—— **撤销的终点不是固定状态，而是它**。
 4. **一个事务**内：

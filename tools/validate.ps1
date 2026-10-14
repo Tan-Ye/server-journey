@@ -208,10 +208,17 @@ Check ("图中边数 = 转移表 + 入口边（图 $diagEdges / 表 $($edges.Cou
     "差 $($diagEdges - $edges.Count) 条，期望差 1"
 
 # 被拒绝转移：§5
+# 行以 R 编号开头（R1、R2…），按编号数比按「意图」列数稳 —— 列会随文档演进改名，
+# 编号不会。这也是脚本第一次真正抓到「作者改了表结构但没同步校验逻辑」的例子。
 $sec5 = Get-Section -Lines $sm -From '^## 5\. 被拒绝的转移'
-$rejTable = Get-Table -Lines $sec5 -HeaderPattern '^\| 意图 \|'
-$rejRows = Get-Rows -Table $rejTable -RowPattern '^\| '
+$rejRows = @($sec5 | Where-Object { $_ -match '^\| R\d+ \|' })
 CheckClaim '被拒绝转移条数一致' $sec5 '([0-9]+) 条' $rejRows.Count
+$rejIds = @($rejRows | ForEach-Object { ([regex]::Match($_, '^\| (R\d+)')).Groups[1].Value })
+$dupRej = @($rejIds | Group-Object | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+$rejSeqOk = $true
+for ($i = 0; $i -lt $rejIds.Count; $i++) { if ($rejIds[$i] -ne ('R' + ($i + 1))) { $rejSeqOk = $false } }
+Check ("被拒绝转移编号连续无重复（$($rejIds.Count) 条）") (($dupRej.Count -eq 0) -and $rejSeqOk) `
+    "重复：$($dupRej -join ',')"
 
 # 幂等闸门：§6（标题写「三道闸门」，用中文数字）
 $sec6 = Get-Section -Lines $sm -From '^## 6\. 幂等'

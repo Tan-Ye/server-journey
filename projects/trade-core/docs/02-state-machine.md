@@ -79,6 +79,8 @@ stateDiagram-v2
 
 ### `order_items.refund_status` 取值
 
+> 代码里的类型名是 `OrderItemRefundStatus`（`refunds.status` 那个另叫 `RefundRecordStatus`）—— 两个退款状态枚举**必须分开命名**，见 `03-api-contract.md` §6。
+
 | 取值 | 含义 | 钱的状态 | 可否再次申请退款 |
 | --- | --- | --- | --- |
 | `NONE` | 无退款 | — | 可以 |
@@ -95,7 +97,7 @@ stateDiagram-v2
 | 订单项 `refund_status` 分布 | 订单级状态 | 说明 |
 | --- | --- | --- |
 | 全部 `NONE`（或 `REVOKED`） | 保持 `PAID` / `SHIPPED` / `DELIVERED` / `COMPLETED` | 无在途退款（`REVOKED` 只说明「曾申请过」，不构成退款状态） |
-| 存在 `REFUNDING` 项，且**钱尚未退出** | `REFUNDING` | 退款处理中，$0 已退 |
+| 存在 `REFUNDING` 项，且**钱尚未退出** | `REFUNDING` | 退款处理中，一分钱都还没退出去 |
 | 存在 `REFUNDED` 项（钱已退），且退款项**货未回仓** | `PARTIALLY_REFUNDED` | 钱已退、货在路上 |
 | 全部项 `REFUNDING`，且**钱已退出** | `REFUNDING` | 整单在退 |
 | 全部项 `REFUNDED` | `REFUNDED` | 整单退完 |
@@ -201,29 +203,40 @@ stateDiagram-v2
 
 在货先到、钱后到的情况下，T14/T14a 的生效条件 `status='REFUNDING'` **不命中**，因此状态不变、库存不重复归还，但 `refunds.status` / `payments` 等非状态字段**照常补齐**（这部分不是状态流转，不违反 INV-6）。
 
-## 5. 被拒绝的转移（必须显式报错 · 共 14 条）
+## 5. 被拒绝的转移（必须显式报错 · 共 18 条）
 
-| 意图 | 从 | 结果 | 错误码 |
-| --- | --- | --- | --- |
-| 用户取消 | `PAID` / `SHIPPED` / `DELIVERED` | 拒绝 —— 钱已收，只能走退款 | `409 ORDER_NOT_CANCELLABLE` |
-| 用户取消 | 终态 | 拒绝 | `409 ORDER_ALREADY_FINAL` |
-| 申请退款 | `PENDING_PAYMENT` | 拒绝 —— 钱没收到，无可退 | `409 ORDER_NOT_REFUNDABLE` |
-| 申请退款 | `REFUNDING` / `REFUNDED` / `PARTIALLY_REFUNDED` | 拒绝 —— 已有在途退款 | `409 REFUND_ALREADY_REQUESTED` |
-| 申请退款 | `CANCELLED` | 拒绝 | `409 ORDER_NOT_REFUNDABLE` |
-| 申请退款 | 部分订单项 | 拒绝 —— v1 只支持整单退 | `400 PARTIAL_REFUND_NOT_SUPPORTED` |
-| 撤销退款 | 钱已退出（`refunds.status='SENT'`） | 拒绝 +【需人工介入】 | `409 REFUND_ALREADY_SENT` |
-| 撤销退款 | 货已到仓（有 `return_received_at`） | 拒绝 +【需人工介入】 | `409 RETURN_ALREADY_RECEIVED` |
-| 撤销退款 | 申请时是 `DELIVERED` / `COMPLETED` | 拒绝 +【需人工介入】 | `409 REFUND_NOT_REVOCABLE_SIGNED` |
-| 撤销退款 | 反向预占库存不足 | 拒绝，**整个操作回滚**，保持 `REFUNDING` | `409 REFUND_REVOKE_STOCK_UNAVAILABLE` |
-| 发货 | `SHIPPED` / `DELIVERED` / 终态 | 拒绝（自动任务静默退出，手动调用报错） | `409 INVALID_STATE_TRANSITION` |
-| 签收 | 非 `SHIPPED` | 静默退出（自动） / `409`（手动） | `409 INVALID_STATE_TRANSITION` |
-| 任何事件 | 终态 / 半终态（`PARTIALLY_REFUNDED`） | 拒绝 —— INV-6 | `409 ORDER_ALREADY_FINAL`（回调类事件返回 200 + 落 `IGNORED`，不对支付方报错） |
+| # | 意图 | 从 | 结果 | HTTP + 错误码 |
+| --- | --- | --- | --- | --- |
+| R1 | 用户取消 | `PAID` / `SHIPPED` / `DELIVERED` | 拒绝 —— 钱已收，只能走退款 | `409 ORDER_NOT_CANCELLABLE` |
+| R2 | 用户取消 | 终态 | 拒绝 | `409 ORDER_ALREADY_FINAL` |
+| R3 | 申请退款 | `PENDING_PAYMENT` | 拒绝 —— 钱没收到，无可退 | `409 ORDER_NOT_REFUNDABLE` |
+| R4 | 申请退款 | `CANCELLED` | 拒绝 —— 同上 | `409 ORDER_NOT_REFUNDABLE` |
+| R5 | 申请退款 | `REFUNDED` | 拒绝 —— 已退过款 | `409 ORDER_ALREADY_FINAL` |
+| R6 | 申请退款 | `REFUNDING` / `PARTIALLY_REFUNDED` | 拒绝 —— 已有在途退款 | `409 REFUND_ALREADY_REQUESTED` |
+| R7 | 申请退款 | 部分订单项（未覆盖全部项） | 拒绝 —— v1 只支持整单退 | `400 PARTIAL_REFUND_NOT_SUPPORTED` |
+| R8 | 撤销退款 | 订单不在 `REFUNDING` | 拒绝 —— 无退款可撤 | `409 REFUND_NOT_REVOCABLE` |
+| R9 | 撤销退款 | 钱已退出（`refunds.status='SENT'`） | 拒绝 +【需人工介入】 | `409 REFUND_ALREADY_SENT` |
+| R10 | 撤销退款 | 货已到仓（有 `return_received_at`） | 拒绝 +【需人工介入】 | `409 RETURN_ALREADY_RECEIVED` |
+| R11 | 撤销退款 | 申请退款时订单是 `DELIVERED` / `COMPLETED` | 拒绝 +【需人工介入】 | `409 REFUND_NOT_REVOCABLE_SIGNED` |
+| R12 | 撤销退款 | 反向预占库存不足 | 拒绝，**整个操作回滚**，保持 `REFUNDING` | `409 REFUND_REVOKE_STOCK_UNAVAILABLE` |
+| R13 | 发货 | `SHIPPED` / `DELIVERED` / 终态 | 拒绝（自动任务静默退出，手动调用报错） | `409 INVALID_STATE_TRANSITION` |
+| R14 | 签收 | 非 `SHIPPED` | 静默退出（自动） / 报错（手动） | `409 INVALID_STATE_TRANSITION` |
+| R15 | 确认收货 | 非 `DELIVERED` | 静默退出（自动任务） | — |
+| R16 | 支付回调 | 金额 ≠ 订单金额 | 拒绝流转，落 `AMOUNT_MISMATCH` +【需人工介入】 | 对支付方仍返 **200**；码只落事件表 |
+| R17 | 支付回调 | 订单已是终态（延迟/乱序回调） | 拒绝流转，落 `IGNORED` | 对支付方仍返 **200** |
+| R18 | 任何事件 | 终态 / 半终态（`PARTIALLY_REFUNDED`） | 拒绝 —— INV-6 | `409 ORDER_ALREADY_FINAL`（回调类事件走 R16/R17 的 200 路径） |
+
+**两条读表规则**
+
+1. **HTTP 码只用于「对客户端」的响应**。R16、R17 是回调场景：业务上拒绝流转，协议上必须返回 200 —— 否则支付方会无限重推（见 `03-api-contract.md` §4 规则 1）。
+2. 表中每一条都必须在代码里可触发；**没有对应拒绝路径的「理论非法转移」不需要单列**，由状态机的 `next_status` 返回 `None` 兜底。
 
 > **对支付方与对用户要区别对待**：支付方的回调即使状态不匹配也必须返回 200（否则会被无限重推），差异记录在 `payment_events.status = IGNORED`；对用户的手动操作才返回 409。
 
 ## 6. 幂等：三道闸门
 
 DoD #3 与 #4 全部依赖这三道闸门。**任何状态转移都必须同时受它们保护。**
+
 | 闸门 | 机制 | 拦住的重复 | 对应转移 |
 | --- | --- | --- | --- |
 | 闸门 1 · 请求级 | `idempotency_keys` 表（`key` 唯一 + 请求指纹） | 用户重复提交下单 | T1 |
@@ -260,8 +273,8 @@ DoD #3 与 #4 全部依赖这三道闸门。**任何状态转移都必须同时�
 `crates/domain/state_machine/` 是唯一真相源，建议形状：
 
 - **状态与事件用枚举**，不用字符串：`enum OrderStatus { PendingPayment, Paid, Shipped, Delivered, Completed, Refunding, PartiallyRefunded, Refunded, Cancelled }`（9 个），`enum OrderEvent { ... }`（对应第 3 节 13 个事件，含 `REFUND_REVOKED`）
-- **一个纯函数做判定**：`fn next_status(from: OrderStatus, event: OrderEvent) -> Option<OrderStatus>` —— 返回 `None` 即非法转移。**这是唯一可以写「合法转移」的地方**，Handler 与 Service 都不许自己判断状态
-- **纯函数、零 I/O**：不依赖 `axum`、不依赖 `sqlx`，全部用表驱动单测覆盖（24 条边 + 第 5 节的拒绝清单，每条一个用例）
+- **一个纯函数做判定**：`fn next_status(from: OrderStatus, event: OrderEvent, ctx: &TransitionCtx) -> Option<OrderStatus>` —— 返回 `None` 即非法转移。**这是唯一可以写「合法转移」的地方**，Handler 与 Service 都不许自己判断状态（为什么需要第三个参数见下方「签名上的一个坑」）
+- **纯函数、零 I/O**：不依赖 `axum`、不依赖 `sqlx`，全部用表驱动单测覆盖（**24 条边 + 第 5 节的 18 条拒绝路径**，每条一个用例）
 - **`WHERE` 子句由转移表生成**：条件更新的期望状态直接取自转移表的「生效条件」列，避免代码与文档分叉
 
 > **签名上的一个坑**：`next_status` 只知道「当前状态 + 事件」，但 T14 与 T14a、T15 与 T15a、T16a 与 T16b 的分岔还取决于「退款项是否还有在途的」；T18 与 T18a 的分岔取决于「申请退款前是什么状态」。这些信息都不在 `OrderStatus` 里，所以状态机需要第二条输入 —— 建议把签名扩成 `fn next_status(from: OrderStatus, event: OrderEvent, ctx: TransitionCtx) -> Option<OrderStatus>`，其中 `TransitionCtx` 只携带**纯数据**：`pending_return_items: bool`、`refund_from_status: Option<OrderStatus>`、`refund_money_sent: bool`、`return_received: bool`（仍然零 I/O）。不要退化成在 Service 层用 `if` 判断终点状态，否则「合法转移只在一处定义」就破了。
@@ -293,7 +306,7 @@ DoD #3 与 #4 全部依赖这三道闸门。**任何状态转移都必须同时�
 | 7 | **撤销退款时反向预占失败** | 撤销申请但库存已被买走 | 回滚，保持 `REFUNDING`，返回 `409 REFUND_REVOKE_STOCK_UNAVAILABLE` | 告知用户无货可留，建议接受退款 |
 | 8 | **已签收订单申请撤销退款** | 申请时状态为 `DELIVERED` / `COMPLETED` | 拒绝（`409 REFUND_NOT_REVOCABLE_SIGNED`） | 判断货是否真的未寄出，人工决定 |
 | 9 | **库存对账不平** | `available + reserved + in_transit + damaged` 穿仓或与累计入库不符（INV-1/INV-2 违反） | 对账任务告警，**不自动修正** | 查数据来源，人工平账 |
-| 10 | **订单关键字段被手工拨坏** | 例如发货时 `reserved < n`（B5 分支） | 事务回滚 + 告警 | 直接改数据库修正 |
+| 10 | **订单关键字段被手工拨坏** | 例如发货时 `reserved < n` | 事务回滚 + 告警（见 §5 R13 与 `01-usecases.md` 用例 4 的 B5） | 直接改数据库修正 |
 | 11 | **重复支付** | 同一订单收到两笔 `PAY_SUCCESS`（不同 `event_id`） | 第二笔落 `IGNORED`，告警 | 人工退还多收的一笔 |
 
 > **设计原则**：这些场景的共同点是「系统的自动规则会得出错误结果，或无法得出唯一结果」。遇到它们时**宁可停在中间态 + 告警，也不要猜着往下走** —— 猜错的代价（错退钱、错扣库存）远高于停在中间态让人来看一眼。

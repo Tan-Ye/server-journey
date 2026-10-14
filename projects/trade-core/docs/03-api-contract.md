@@ -72,6 +72,7 @@ pub enum OrderStatus {
 | 分页 | `?page=1&page_size=20`，`page_size` 上限 50；响应 `meta` 返回 `total` / `has_more` |
 | 排序 | `?sort=created_at:desc`（默认按 `created_at` 倒序） |
 | 空值 | 用 `null`，不用空字符串或 `0` 代替 |
+| 错误定位 | 错误响应应尽量带 `error.detail.order_id`（或 `product_id`），便于前端知道是哪一单失败。**批量压测时尤其重要** |
 
 ## 3. 统一响应包体
 
@@ -141,7 +142,7 @@ pub enum OrderStatus {
 | `404 Not Found` | 资源不存在 | 订单/商品不存在 | 提示资源不存在 |
 | `409 Conflict` | **状态冲突（本项目最常用）** | 库存不足、幂等冲突、状态不可流转、退款不可撤销 | 按 `error.code` 分流；`retryable=true` 才重试 |
 | `429 Too Many Requests` | 触发限流 | W6 落地 | 按 `Retry-After` 退避重试 |
-| `500 Internal Server Error` | 服务端异常 | 未预期错误（数据库断连、panic 捕获） | 可重试，需带 `X-Request-Id` 报障 |
+| `500 Internal Server Error` | 服务端异常 | 未预期错误（数据库断连、panic 捕获） | 指数退避重试，需带 `X-Request-Id` 报障 |
 | `503 Service Unavailable` | 依赖不可用或正在关闭 | Postgres/Redis 不可达、优雅停机中 | 按 `Retry-After` 重试 |
 
 ### 两条容易搞反的规则
@@ -153,14 +154,17 @@ pub enum OrderStatus {
 
 **所有错误码集中于 `api/src/error.rs` 的 `ErrorCode` 枚举**（或 `domain/src/error.rs`，取决于是否需要被 domain 引用）。下表每一项都必须在代码里有对应 `///` 注释。
 
+**编号规则**：`<HTTP 状态码><两位序号>`，如 `409` 组的第 1 个是 `40901`。**号码只增不复用** —— 删除某个码时把号码废弃，不要把它分配给新码，否则历史日志会对不上。
+**为什么错误码从 40001 起**：响应体 `code = 0` 表示成功，所以错误码不能占用 0 附近的小整数。
+
 ### 5.1 校验与资源类（HTTP 400 / 404）
 
 | 数字码 | 字符串码 | HTTP | 触发条件 | 可重试 |
 | --- | --- | --- | --- | --- |
 | 40001 | `VALIDATION_ERROR` | 400 | 请求体字段缺失、类型错、`quantity <= 0`、items 为空 | ✗ |
 | 40002 | `PARTIAL_REFUND_NOT_SUPPORTED` | 400 | 退款请求只带了部分订单项（v1 只支持整单退） | ✗ |
-| 40401 | `PRODUCT_NOT_FOUND` | 404 | 商品不存在 | ✗ |
-| 40402 | `ORDER_NOT_FOUND` | 404 | 订单不存在（或不属于当前用户，避免泄露存在性） | ✗ |
+| 40401 | `PRODUCT_NOT_FOUND` | 404 | 商品不存在（或已下架且被 `on_sale_only=false` 排除） | ✗ |
+| 40402 | `ORDER_NOT_FOUND` | 404 | 订单不存在。**也用于「订单不属于当前用户」**，避免通过响应差异探测他人订单是否存在 | ✗ |
 
 ### 5.2 认证授权类（HTTP 401 / 403）
 
@@ -191,8 +195,8 @@ pub enum OrderStatus {
 | 40921 | `INVALID_STATE_TRANSITION` | 409 | 目标状态与当前状态不相容（如对已发货订单发货） | ✗ |
 | 40922 | `ORDER_NOT_CANCELLABLE` | 409 | 对 `PAID` 及之后的订单调取消（钱已收，只能走退款） | ✗ |
 | 40923 | `ORDER_NOT_REFUNDABLE` | 409 | 对 `PENDING_PAYMENT` / `CANCELLED` 申请退款（钱没收到，无可退） | ✗ |
-| 40924 | `ORDER_ALREADY_FINAL` | 409 | 对终态订单发起任何流转（INV-6） | ✗ |
-| 40925 | `AMOUNT_MISMATCH` | 409 | 回调金额 ≠ 订单金额。**状态零流转** +【需人工介入】#3 | ✗ |
+| 40924 | `ORDER_ALREADY_FINAL` | 409 | 对终态订单发起任何流转（INV-6）。例：重复取消一笔已取消的订单 | ✗ |
+| 40926 | `AMOUNT_MISMATCH` | 409 | 回调金额 ≠ 订单金额。**状态零流转** +【需人工介入】#3。注意：对支付方的 HTTP 响应仍是 200，此码只落在 `payment_events` 与告警里 | ✗ |
 
 ### 5.6 退款与退货类（HTTP 409）
 
@@ -248,7 +252,8 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// 数字错误码，用于响应体的 `code` 字段（0 表示成功，故错误码从 10000 起）。
+    /// 数字错误码，用于响应体的 `code` 字段。格式为 `<HTTP 状态码><两位序号>`，
+    /// 从 40001 起（0 表示成功，故不复用 0 附近的小整数）。
     pub fn as_number(self) -> u32 { /* ... */ }
 
     /// 对应的 HTTP 状态码。
@@ -275,10 +280,12 @@ impl ErrorCode {
 | `OrderEvent` | 13 个 | 内部事件，是否需要暴露给前端取决于是否做订单事件流（v1 不暴露，可不加 `ToSchema`） |
 | `PaymentResult` | `PAY_SUCCESS` / `PAY_FAILED` / `REFUND_SUCCESS` | 回调入参，需 `///` 说明各自的状态流转后果 |
 | `PaymentEventStatus` | `PROCESSED` / `IGNORED` / `AMOUNT_MISMATCH` / `UNKNOWN_ORDER` | 管理端排障用，`///` 必须写清「什么情况会落到这个值」 |
-| `RefundStatus` | `PENDING` / `CREATED` / `SENT` / `SUCCESS` / `FAILED` / `REVOKED` | **`SENT` 是关键分界**：撤销能否成功、`refund_status` 记 `NONE` 还是 `REVOKED` 全靠它 |
-| `RefundStatus`（订单项） | `NONE` / `REFUNDING` / `REFUNDED` / `REVOKED` | `REVOKED` 语义见 `02-state-machine.md` §2 —— 表示「曾申请过且钱发出过」 |
+| `RefundRecordStatus`（`refunds.status`） | `PENDING` / `CREATED` / `SENT` / `SUCCESS` / `FAILED` / `REVOKED` | **`SENT` 是关键分界**：撤销能否成功、订单项 `refund_status` 记 `NONE` 还是 `REVOKED` 全靠它 |
+| `OrderItemRefundStatus`（`order_items.refund_status`） | `NONE` / `REFUNDING` / `REFUNDED` / `REVOKED` | `REVOKED` 语义见 `02-state-machine.md` §2 —— 表示「曾申请过且钱发出过」 |
 | `ReturnCondition` | `GOOD` / `DAMAGED` | 退货验货结果，决定库存进 `available` 还是 `damaged` |
 | `CancelReason` | `TIMEOUT` / `USER_CANCEL` / `USER_REFUND` | 取消原因，对账与排障用 |
+
+> **两个退款状态枚举必须分开命名**：`refunds.status`（一次退款记录的状态）与 `order_items.refund_status`（一个订单项的退款状态）取值不同、生命周期不同。**不要都叫 `RefundStatus`** —— Rust 里一个模块不能有两个同名类型，硬合并会导致其中一个语义被扭曲。
 
 > **未在文档中定义的枚举不要凭空造**：需要新增时先改本文档与 `02-state-machine.md`，再写代码。契约文档是上游。
 
@@ -408,16 +415,16 @@ pub const RATE_LIMIT_CALLBACK_PER_MINUTE: u32 = 600;
 | --- | --- |
 | 查询参数 | `status`（可选，多值逗号分隔）、`page`、`page_size`、`sort` |
 | 成功 | `200 OK`，`data` 为数组，`meta` 带分页信息 |
-| 错误 | 端点特有：无。`page_size > MAX_PAGE_SIZE` 时**截断而非报错**；`status` 传了非法枚举值才返回 `400 VALIDATION_ERROR` |
+| 错误 | 端点特有：`400 VALIDATION_ERROR`（`status` 传了非法枚举值）。`page_size > MAX_PAGE_SIZE` 时**截断而非报错** |
 
 #### `GET /orders/{id}` —— 订单详情
 
 | 项 | 内容 |
 | --- | --- |
-| 成功 | `200 OK`。`data` 含 `status` / `total_amount` / `expires_at` / `paid_at` / `shipped_at` / `delivered_at` / `refund_requested_at` 与逐项 `refund_status` |
-| 错误 | 端点特有：`403 FORBIDDEN`（他人订单）、`404 ORDER_NOT_FOUND` |
+| 成功 | `200 OK`。`data` 含 `status` / `total_amount` / `created_at` / `expires_at` / `auto_ship_at` / `paid_at` / `shipped_at` / `expected_delivered_at` / `delivered_at` / `completed_at` / `refund_requested_at` / `cancelled_at` / `cancel_reason`，以及逐项 `refund_status` |
+| 错误 | 端点特有：`404 ORDER_NOT_FOUND`（不存在 **或不属于当前用户**，两者不区分） |
 
-> **越权与不存在的取舍**：`GET /orders/{id}` 对**他人的订单**返回 `403`，对**不存在的 ID** 返回 `404`。两者可区分是因为订单 ID 是 UUID，猜不到，不存在性泄露风险可接受；若要更严可统一返回 `404`。
+> **为什么不用 403 而统一 404**：若「他人订单」返回 403、「不存在」返回 404，攻击者就能用响应差异逐个探测哪些订单 ID 真实存在（UUID 猜不到，但一旦从别处泄露一个就能确认）。统一 404 让两种情况不可区分。Admin 接口不受此约束 —— 调用者本来就有全局权限。
 
 #### `POST /orders/cancel/{id}` —— 取消未支付订单
 
@@ -432,11 +439,11 @@ pub const RATE_LIMIT_CALLBACK_PER_MINUTE: u32 = 600;
 
 | 项 | 内容 |
 | --- | --- |
-| 请求体 | `{ "reason": "用户备注，可选" }`；**不传退款项 = 整单退**（v1 只支持这种） |
+| 请求体 | `{ "reason": "可选", "items": [{"order_item_id": "...", "quantity": 1}] }`。**`items` 省略 = 整单退**（v1 唯一支持的形态）；显式传 `items` 时必须覆盖**全部**订单项且数量等于购买数量，否则返回 `400 PARTIAL_REFUND_NOT_SUPPORTED` |
 | 成功 | **`202 Accepted`** —— 钱还没退，最终状态由支付方回调决定。`data.status = "REFUNDING"` |
 | 副作用 | 按申请时订单状态分路：`PAID` → 立即归还库存；`SHIPPED` / `DELIVERED` / `COMPLETED` → **库存不动**，等退货入库 |
 | 幂等 | 重复申请 → `409 REFUND_ALREADY_REQUESTED` |
-| 错误 | 端点特有：`400 PARTIAL_REFUND_NOT_SUPPORTED`、`403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 ORDER_NOT_REFUNDABLE`（`PENDING_PAYMENT` / `CANCELLED`）、`409 REFUND_ALREADY_REQUESTED` |
+| 错误 | 端点特有：`400 PARTIAL_REFUND_NOT_SUPPORTED`、`403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 ORDER_NOT_REFUNDABLE`（`PENDING_PAYMENT` / `CANCELLED`）、`409 REFUND_ALREADY_REQUESTED`、`409 ORDER_ALREADY_FINAL`（已 `REFUNDED`） |
 
 ```json
 // POST /orders/refund/{id}  请求（字段可省，省略即整单退）
@@ -463,8 +470,8 @@ pub const RATE_LIMIT_CALLBACK_PER_MINUTE: u32 = 600;
 | --- | --- |
 | 成功 | `200 OK`，`data.status` 回到 `refund_from_status`（`PAID` 或 `SHIPPED`） |
 | 副作用 | `PAID` 场景**反向预占**（`available → reserved`）；`SHIPPED` 场景库存不动 |
-| 关键规则 | 钱已发出或货已到仓 → 拒绝；反向预占失败 → **整个操作回滚** |
-| 错误 | 端点特有：`400 PARTIAL_REFUND_NOT_SUPPORTED`、`403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 REFUND_ALREADY_SENT`【人工#1】、`409 RETURN_ALREADY_RECEIVED`【人工】、`409 REFUND_NOT_REVOCABLE_SIGNED`【人工#8】、`409 REFUND_REVOKE_STOCK_UNAVAILABLE`【人工#7】、`409 REFUND_NOT_REVOCABLE` |
+| 关键规则 | 钱已发出或货已到仓 → 拒绝；反向预占失败 → **整个操作回滚**。撤销天然是整单撤销，不存在部分退款的判断 |
+| 错误 | 端点特有：`403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 REFUND_NOT_REVOCABLE`（订单不在 `REFUNDING`）、`409 REFUND_ALREADY_SENT`【人工#1】、`409 RETURN_ALREADY_RECEIVED`【人工】、`409 REFUND_NOT_REVOCABLE_SIGNED`【人工#8】、`409 REFUND_REVOKE_STOCK_UNAVAILABLE`【人工#7】 |
 
 ### 8.2 商品
 
@@ -474,7 +481,7 @@ pub const RATE_LIMIT_CALLBACK_PER_MINUTE: u32 = 600;
 | --- | --- |
 | 查询参数 | `page`、`page_size`、`on_sale_only`（默认 `true`） |
 | 成功 | `200 OK`。每项含 `id` / `name` / `price`（分）/ `available`（可售数量，**只读**） |
-| 错误 | 端点特有：`400 VALIDATION_ERROR`、`404 PRODUCT_NOT_FOUND` |
+| 错误 | 端点特有：无（列表接口不会 404；`on_sale_only` 是过滤器，过滤后为空是正常的 200 + 空数组） |
 
 #### `GET /products/{id}` —— 商品详情
 
@@ -518,7 +525,7 @@ pub const RATE_LIMIT_CALLBACK_PER_MINUTE: u32 = 600;
 | 用途 | 本地开发/压测时免去接真实支付方；内部走**同一条**回调处理链路，不另写一份 |
 | 成功 | `200 OK`，`data.status = "PAID"`（并触发自动发货入队） |
 | 限制 | **仅当 `APP_ENV != production` 时注册该路由**，生产环境应 404 |
-| 错误 | 端点特有：`404 ORDER_NOT_FOUND`（含路由未注册时的 404）、`409 ORDER_ALREADY_FINAL` |
+| 错误 | 端点特有：`404 ORDER_NOT_FOUND`（含路由未注册时的 404）。**状态不匹配不报错** —— 它走与真实回调同一条链路，返回 `200` + 落 `IGNORED`，与真实回调行为保持一致 |
 
 ```json
 // POST /payments/mock-success/{order_id} 响应
@@ -550,7 +557,7 @@ pub const RATE_LIMIT_CALLBACK_PER_MINUTE: u32 = 600;
 | --- | --- | --- | --- |
 | `POST /admin/orders/ship/{id}` | 手动发货，走与自动任务**同一个**服务方法 | `200`，`status=SHIPPED` | `403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 INVALID_STATE_TRANSITION`（非 `PAID`） |
 | `POST /admin/orders/deliver/{id}` | 手动签收，走与自动任务**同一个**服务方法 | `200`，`status=DELIVERED` | `403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 INVALID_STATE_TRANSITION`（非 `SHIPPED`） |
-| `POST /admin/orders/return-received/{id}` | 手动确认退货包裹入库 | `200`，`status` 依到位情况为 `REFUNDED` 或 `PARTIALLY_REFUNDED` | `403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 INVALID_STATE_TRANSITION` |
+| `POST /admin/orders/return-received/{id}` | 手动确认退货包裹入库。**前置**：订单为 `REFUNDING` 或 `REFUNDED`，且对应订单项的 `return_received_at IS NULL`；请求体可带 `{ "item_ids": [...], "condition": "GOOD" }`（`condition` 也可为 `DAMAGED`），省略则视为「本次到仓的是全部剩余项、验货合格」 | `200`，`status` 依到位情况为 `REFUNDED` 或 `PARTIALLY_REFUNDED` | `403 FORBIDDEN`、`404 ORDER_NOT_FOUND`、`409 INVALID_STATE_TRANSITION`（如货已全部入库） |
 | `GET /admin/orders` | 按状态筛选订单，`REFUNDING` 队列靠它 | `200`，分页 | `403 FORBIDDEN` |
 | `GET /healthz` | 存活探测（D6 实现） | `200`，`data` 含 `db` / `redis` 连通性 | 无（依赖不可用直接 `503 SERVICE_UNAVAILABLE`，即通用错误） |
 
