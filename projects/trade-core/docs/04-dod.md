@@ -73,7 +73,20 @@
 
 **Redis 与数据库的分工**：Redis 只做「什么时候该处理」的调度，**不参与正确性判断**。所有「能不能改」的判断都在数据库的条件更新里。这样 Redis 丢数据最多导致晚一点处理，不会导致处理错。
 
-## 3. 表字段草案（七张表）
+## 3. 表字段草案（八张表）
+
+**为什么是八张**：前七张围绕订单，第八张 `products` 是商品主数据 —— 没有它，`order_items.product_id` 与 `stock.product_id` 就指向一个不存在的表，「商品存在且 `ON_SALE`」这个前置条件也无处可查。
+
+| 表 | 粒度 | 职责 |
+| --- | --- | --- |
+| `products` | 一商品一行 | 商品主数据：名称、价格、是否在售 |
+| `stock` | 一商品一行 | **只放数量**，四个库存栏 + 累计入库 |
+| `orders` / `order_items` | 一单 / 一项 | 交易 |
+| `payments` / `payment_events` | 一笔 / 一次回调 | 钱与回调幂等 |
+| `refunds` | 一次退款 | 退款状态机 |
+| `idempotency_keys` | 一个幂等键 | 请求幂等 |
+
+> **`stock` 不是「订单下的库存表」**：它与订单没有从属关系，而是**按商品**记账（`product_id` 是主键）。订单只是「借走」了其中若干件，靠 `order_items` 记录借了多少。
 
 **通用约定**
 
@@ -84,7 +97,24 @@
 - 所有表带 `created_at` / `updated_at`
 - 唯一约束的命名统一 `uq_<表>_<列>`，便于排障
 
-### 3.1 `orders` —— 订单主表
+### 3.1 `products` —— 商品主数据
+
+| 列 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | `BIGINT PK` | 商品 ID，对外暴露（`GET /products` 用它） |
+| `name` | `TEXT NOT NULL` | 商品名 |
+| `status` | `TEXT NOT NULL` | `ON_SALE` / `OFF_SALE` —— **用例 1 的前置条件就是查这一列** |
+| `price_cent` | `BIGINT NOT NULL` | 售价，单位分。`CHECK (price_cent >= 0)` |
+| `created_at` / `updated_at` | `TIMESTAMPTZ NOT NULL` | — |
+
+**索引**：`(status)`（商品列表默认只列在售）。
+**两条硬纪律**：
+1. **商品不上物理删除**，下架只改 `status = 'OFF_SALE'`。历史订单的展示与退款都依赖它存在。
+2. **`price_cent` 可改，但只影响之后的新订单** —— 已成交订单的价格在下单那一刻就快照进 `order_items.unit_price`，改价不影响历史（`orders.total_amount` 也已经在当时算定）。
+
+> **`GET /products` 为什么返回 `available`**：它需要 `products` 与 `stock` 两张表各取一部分（`products` 给名称与价格，`stock` 给可售数量）。契约见 `03-api-contract.md` §8.2。
+
+### 3.2 `orders` —— 订单主表
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
@@ -103,13 +133,13 @@
 **索引**：`(user_id, created_at DESC)`（我的订单列表）；`(status, expires_at)`（超时扫描）；`(status, auto_ship_at)`（自动发货扫描）；`(status, expected_delivered_at)`（自动签收扫描）。
 **约束**：`CHECK (total_amount >= 0)`；`CHECK (status IN (...9 个...))`。
 
-### 3.2 `order_items` —— 订单项
+### 3.3 `order_items` —— 订单项
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
 | `id` | `BIGSERIAL PK` | 内部主键 |
 | `order_id` | `UUID NOT NULL REFERENCES orders(id)` | — |
-| `product_id` | `BIGINT NOT NULL` | 商品 ID（**不设外键**，商品可被删，靠下面的快照） |
+| `product_id` | `BIGINT NOT NULL REFERENCES products(id) ON DELETE RESTRICT` | 商品 ID。**保留外键但禁止级联删除** —— 商品不允许物理删除（只能下架），外键防的是「stock 里挂了不存在的商品」 |
 | `product_name` | `TEXT NOT NULL` | **价格与名称快照** —— 商品改名/下架不影响历史订单 |
 | `unit_price` | `BIGINT NOT NULL` | 下单时的单价（分） |
 | `quantity` | `INT NOT NULL` | `CHECK (quantity > 0)` |
@@ -122,21 +152,38 @@
 
 **索引**：`(order_id)`；部分索引 `(order_id) WHERE refund_status <> 'NONE'`（退款排查用）。
 
-### 3.3 `stock` —— 库存（一商品一行）
+### 3.4 `stock` —— 库存（**一商品一行，与订单无从属关系**）
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
-| `product_id` | `BIGINT PK` | — |
+| `product_id` | `BIGINT PK REFERENCES products(id) ON DELETE RESTRICT` | **主键就是商品 ID** —— 一个商品只有一行库存 |
 | `available` | `INT NOT NULL` | 可售 |
 | `reserved` | `INT NOT NULL` | 已售未发 |
 | `in_transit` | `INT NOT NULL` | 已发未签收（**退货包裹在途也算这里**） |
-| `damaged` | `INT NOT NULL` | 验货不合格 |
-| `total_inbound` | `INT NOT NULL` | 累计入库总量，用于对账 |
+| `damaged` | `INT NOT NULL` | 验货不合格，不可售 |
+| `total_inbound` | `INT NOT NULL` | **累计入库总量** —— 该商品历史上共有多少件进入过仓库，由种子数据或人工入库设定 |
+| `sold` | **派生值，不建列** | 已正向签收交付用户的件数。由订单聚合得出（见下方 SQL），**不落库** —— 落库就要跟订单状态保持同步，属于重复真相源 |
 
 **约束（关键）**：`CHECK (available >= 0)`、`CHECK (reserved >= 0)`、`CHECK (in_transit >= 0)`、`CHECK (damaged >= 0)` —— **让数据库自己兜住 INV-1**，应用层漏判也扣不出负数。
-**对账**：`available + reserved + in_transit + damaged <= total_inbound`（正向签收后货交付用户，故用 `<=`）。
+**`total_inbound` 的语义与对账**：它是**资产基线**，等于「还在我方手里的 + 已经卖出去的」：
 
-### 3.4 `payments` —— 支付流水
+```
+available + reserved + in_transit + damaged + sold = total_inbound
+```
+
+其中 `sold` = 已经通过正向签收交付用户的件数，可由订单数据聚合：
+
+```sql
+SELECT COALESCE(SUM(oi.quantity), 0) FROM order_items oi
+JOIN orders o ON o.id = oi.order_id
+WHERE oi.product_id = $1 AND o.status IN ('DELIVERED','COMPLETED','REFUNDING','REFUNDED');
+```
+
+> **为什么 `sold` 要算进来**：正向签收后货已交付用户、**离开四栏**，四栏之和必然小于 `total_inbound`，差额就是已售出。所以对账等式必须含 `sold`，单看四栏会误判为「库存丢了」。
+>
+> **退货的两面**：退货包裹入库时 `in_transit → available`（四栏之和不变），而 `total_inbound` **也不变** —— 货本来就在账上，只是从「已售出」回到「可售」。这是 v1 的简化：`sold` 会因此变小，对账恒等式仍成立。
+
+### 3.5 `payments` —— 支付流水
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
@@ -149,14 +196,14 @@
 
 **索引**：`(order_id)`；唯一 `(provider, provider_txn_id)` —— 防同一笔支付被记两次。
 
-### 3.5 `payment_events` —— 回调事件（幂等的关键表）
+### 3.6 `payment_events` —— 回调事件（幂等的关键表）
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
 | `id` | `BIGSERIAL PK` | — |
 | `event_id` | `TEXT NOT NULL UNIQUE` | **支付方事件 ID，唯一约束就是闸门 2** |
 | `provider` | `TEXT NOT NULL` | — |
-| `order_id` | `UUID NULL` | 可能查无此单（`UNKNOWN_ORDER`） |
+| `order_id` | `UUID NULL REFERENCES orders(id) ON DELETE RESTRICT` | 允许为空：订单不存在的回调也要落库（记 `UNKNOWN_ORDER` + 告警），**不能因为找不到订单就把事实丢掉** |
 | `result` | `TEXT NOT NULL` | `PAY_SUCCESS` / `PAY_FAILED` / `REFUND_SUCCESS` |
 | `amount` | `BIGINT NULL` | 回调金额，用于比对 |
 | `status` | `TEXT NOT NULL` | `PROCESSED` / `IGNORED` / `AMOUNT_MISMATCH` / `UNKNOWN_ORDER` |
@@ -167,7 +214,7 @@
 
 **索引**：`(order_id)`；`(status) WHERE status <> 'PROCESSED'`（**异常事件排查面板**，对应【需人工介入】场景）。
 
-### 3.6 `refunds` —— 退款记录
+### 3.7 `refunds` —— 退款记录
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
@@ -183,7 +230,7 @@
 **`SENT` 是关键分界**：撤销能否成功、`order_items.refund_status` 记 `NONE` 还是 `REVOKED`，全靠它（`02-state-machine.md` §2）。
 **唯一约束**：同一 `order_id` 同时只允许一条非终态退款 —— 用部分唯一索引 `uq_refunds_active ON refunds(order_id) WHERE status IN ('PENDING','CREATED','SENT')`。
 
-### 3.7 `idempotency_keys` —— 下单幂等表
+### 3.8 `idempotency_keys` —— 下单幂等表
 
 | 列 | 类型 | 说明 |
 | --- | --- | --- |
@@ -197,27 +244,35 @@
 
 **索引**：`(expires_at)` 供清理任务；`key` 上的唯一约束即闸门 1。
 
-### 3.8 表之间的关系
+### 3.9 表之间的关系
 
 ```mermaid
 erDiagram
+    products ||--|| stock : "1:1（同 product_id）"
+    products ||--o{ order_items : "1:N"
     orders ||--o{ order_items : "1:N"
     orders ||--o{ payments : "1:N"
     orders ||--o{ payment_events : "0:N"
     orders ||--o{ refunds : "0:N"
-    order_items }o--|| stock : "product_id 关联（无外键）"
     idempotency_keys |o--|| orders : "完成后绑定 order_id"
 ```
 
-> `order_items.product_id` 与 `stock.product_id` **故意不建外键**：商品下架不该阻挡历史订单的任何操作（退款要用快照的价格）。这是有意的反范式。
+> **两处刻意的反范式，别在写迁移时「顺手修正」**：
+>
+> 1. **`order_items` 存 `product_name` 与 `unit_price` 快照** —— 商品改名或改价后，历史订单必须还能正确展示与退款。所以退款金额一律用快照算，**不 JOIN `products`**。
+> 2. **`products` 与 `stock` 是两张表而不是一张** —— 商品主数据（名称/价格/在售状态）与库存数量（四栏 + 累计入库）的变更频率和变更原因完全不同：改价不该碰库存行，扣库存也不该锁价格。合表会让秒杀时的行锁竞争覆盖到商品信息上。
 
 ## 4. 交给阶段 3 的待办
 
-1. **迁移脚本**：`migrations/0001_init.sql` 建这七张表 + 约束 + 索引。约束（`CHECK >= 0`、唯一索引）要跟着迁移一起上，不要事后补。
+1. **迁移脚本**：`migrations/0001_init.sql` 建这八张表 + 约束 + 索引。约束（`CHECK >= 0`、唯一索引、外键）要跟着迁移一起上，不要事后补。
 2. **六个环境变量的落地**：`ORDER_TIMEOUT` / `AUTO_SHIP_DELAY` / `AUTO_SIGN_DAYS` / `COMPLETED_AFTER_DAYS` / `AUTO_RETURN_DAYS` / `SCAN_INTERVAL`，与 `03-api-contract.md` §7 的常量一一对应。
-3. **对账 SQL**：`available + reserved + in_transit + damaged <= total_inbound`，以及「订单数 vs 库存占用」的核对，作为 DoD #8 恢复演练的校验依据。
-4. **仍未定**：
+3. **对账 SQL** 两条，都作为 DoD #8 恢复演练的校验依据：
+   - 库存两侧相等：`available + reserved + in_transit + damaged + sold = total_inbound`（`sold` 由订单聚合，见 §3.4）
+   - 订单与库存占用相符：所有未取消订单的项数量之和 = `reserved`（单商品口径）
+4. **`products` 的种子数据**：压测需要「库存 100 的商品」，所以 `0002_seed.sql` 要能插入商品 + 对应 `stock` 行（`total_inbound = 100`）。**这是 DoD #1 能跑起来的前提。**
+5. **仍未定**：
    - `damaged` 库存的处置流程（报废 / 折价），v1 只记账 + 打【需人工介入】标注
    - `INTERCEPT_*` 字段是否需要建（第 2 路拦截只记录 `intercept_requested_at`）
    - 是否给 `orders` 加审计表 `order_events`（记录每次状态流转），或只依赖日志
-5. **一个设计假设需要验证**：v1 不引入 Redis 预扣库存，全靠数据库条件更新。**若 W8 压测发现数据库扛不住 1000 并发，再评估加预扣** —— 但那时要先证明「慢」而不是「错」。
+   - **`total_inbound` 在真实入库流程里由谁维护** —— v1 没有采购/入库功能，它靠种子数据设定；将来若有入库单据，这里要变成「入库单汇总」而不是手工列
+6. **一个设计假设需要验证**：v1 不引入 Redis 预扣库存，全靠数据库条件更新。**若 W8 压测发现数据库扛不住 1000 并发，再评估加预扣** —— 但那时要先证明「慢」而不是「错」。

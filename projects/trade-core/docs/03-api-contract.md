@@ -576,7 +576,7 @@ pub const RATE_LIMIT_CALLBACK_PER_MINUTE: u32 = 600;
 
 ## 10. 交给 D4 的输入
 
-1. **表字段草案**要能承载本文所有错误码的判定依据。`orders` 表至少需这些「判定用」列（除常规字段外）：
+1. **表字段草案**共**八张表** —— `products` / `stock` / `orders` / `order_items` / `payments` / `payment_events` / `refunds` / `idempotency_keys`（详见 `04-dod.md` §3）。其中 `orders` 表至少需这些「判定用」列（除常规字段外）：
    - 状态与时间：`status`、`expires_at`、`paid_at`、`auto_ship_at`、`shipped_at`、`expected_delivered_at`、`delivered_at`、`completed_at`、`refund_requested_at`、`cancelled_at`、`cancel_reason`
    - 退款判定：`order_items.refund_from_status`（**撤销必需**）、`refund_status`（含 `REVOKED`）、`refund_shipped_at`、`return_received_at`、`return_condition`
    - 支付与事件：`refunds.status`（含 `SENT` 与 `REVOKED`）、`refunds.attempt_count`、`payment_events.status`（含 `IGNORED` / `AMOUNT_MISMATCH` / `UNKNOWN_ORDER`）

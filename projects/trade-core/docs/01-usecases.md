@@ -24,6 +24,8 @@
 
 ### 库存模型（四栏）
 
+> **粒度**：`stock` 是**按商品**记账的（一行 = 一个商品），**不是「订单下的库存表」**。订单与库存没有从属关系 —— 下单只是从对应商品那一行「借走」若干件，借了多少记在 `order_items` 里。
+
 | 字段 | 含义 | 什么时候停在这里 |
 | --- | --- | --- |
 | `available` | 在仓库，可售 | 空闲库存；退货验货合格后也回到这里（**「已签收但未售出」的货就在 available**） |
@@ -38,7 +40,7 @@
 | ID | 不变量 | 对应 |
 | --- | --- | --- |
 | INV-1 | `available` / `reserved` / `in_transit` / `damaged` **四栏均 `>= 0`** | DoD #1 |
-| INV-2 | `available + reserved + in_transit + damaged` = **我方在库/在途**总量。货经正向签收交付用户后即离开这个恒等式，转入「已售出」，不再计入四栏 | 对账 |
+| INV-2 | **库存两侧相等**：`available + reserved + in_transit + damaged + sold = total_inbound`。`sold` = 已经正向签收、交付给用户的件数（货离开了四栏，但账还在）。只对四栏求和会误判为「库存丢了」 | 对账 |
 | INV-3 | 同一 `Idempotency-Key` 只对应一笔订单 | DoD #2 |
 | INV-4 | 同一 `payment_event` 只被消费一次 | DoD #3 |
 | INV-5 | 订单状态只能沿状态机合法边转移，且**每个事件只生效一次** | DoD #3 |
@@ -317,7 +319,7 @@
 | B4 验货不合格 | 退回的商品有损坏 | 库存进 `damaged`（不参与可售），订单仍 `REFUNDED`（钱照退，货损另行处理） |
 | B5 退款失败 | 支付方退款 API 报错 | `refunds.status = 'FAILED'`，订单**保持 `REFUNDING`**，可重试；不得提前入 `REFUNDED` |
 | B6 订单已被取消 | 申请退款时是 `CANCELLED` | `409 ORDER_NOT_REFUNDABLE`（钱没收到，无可退） |
-| B7 商品已删除 | 商品下架/被删 | 用 `order_items` 的价格与数量快照计算退款额，不依赖商品表 |
+| B7 商品已删除 | 商品下架/被改价/被删 | 用 `order_items` 的价格与数量快照计算退款额，**不 JOIN `products`**。v1 也不允许物理删除商品，只能置 `OFF_SALE` |
 | B8 退货包裹丢失 | 超期未签收（超 `AUTO_RETURN_DAYS`） | 保持 `REFUNDING`，**打【需人工介入】#5 标注**并告警（v1 只告警不自动处理） |
 
 **数据变化**
