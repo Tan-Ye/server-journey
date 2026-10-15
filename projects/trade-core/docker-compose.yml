@@ -1,0 +1,88 @@
+# trade-core 本地开发环境
+# Postgres 17 + Redis 7
+#
+# 用法（在 projects/trade-core/ 下）：
+#   docker compose up -d          启动
+#   docker compose ps             看状态，STATUS 应为 healthy 而非仅 Up
+#   docker compose logs -f pg     跟踪日志
+#   docker compose down           停止（保留数据卷）
+#   docker compose down -v        停止并删除数据（重置环境，慎用）
+#
+# 连上容器（不装 psql / redis-cli 也能用）：
+#   docker compose exec pg psql -U trade -d trade_core
+#   docker compose exec redis redis-cli
+
+name: trade-core
+
+services:
+  pg:
+    # 固定大版本，不用 latest —— 避免哪天拉镜像行为变了，排查半天
+    image: postgres:17-alpine
+    container_name: trade-core-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trade
+      POSTGRES_PASSWORD: trade_dev_pw
+      POSTGRES_DB: trade_core
+      # ⚠️ 这两行是必须的，不是可选的。
+      #
+      # 症状：sqlx 报
+      #   "Postgres protocol error: Postgres returned a non-UTF-8 string for its error message"
+      # 根因：不指定时容器回退到系统 locale，PostgreSQL 会把**错误消息翻译成中文**，
+      #       而该消息目录的编码不是 UTF-8，于是 sqlx 解析 ErrorResponse 时直接失败。
+      #       结果是**任何**数据库错误都变成这条看不懂的协议错误，真实原因全被掩盖。
+      #       （实测：服务端返回的 S/M 字段字节解不出合法 UTF-8，SQLSTATE 却正常）
+      # 修法：钉住 locale 为 UTF-8，让消息走英文目录或不翻译。
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      # 命名卷：容器删了数据还在 —— DoD #8 的备份恢复演练要靠它
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 关键：容器「起来了」≠「能连了」。没有这个，迁移会在数据库还没就绪时失败。
+      test: ["CMD-SHELL", "pg_isready -U trade -d trade_core"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - trade-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: trade-core-redis
+    restart: unless-stopped
+    command:
+      # appendonly yes：开启 AOF 持久化。延迟队列（超时取消）就存在 Redis 里，
+      # 丢了会导致「订单永远不被取消」—— 虽然有扫描兜底，但没必要让它兜。
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - trade-net
+
+volumes:
+  pgdata:
+    name: trade-core-pgdata
+  redisdata:
+    name: trade-core-redisdata
+
+networks:
+  trade-net:
+    name: trade-core-net
+    driver: bridge

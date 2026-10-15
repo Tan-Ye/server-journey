@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# 环境变量（含密码，绝不入库）
+.env
+.env.local
+
+# SQLx 离线数据（W9 会决定是否入库，届时改这里）
+/.sqlx/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 构建产物
+/dist/
+/web/node_modules/
+/web/dist/
+
+# 本地备份（DoD #8 演练产物）
+/backups/
+*.dump
+*.sql.gz

@@ -1,0 +1,10 @@
+# 迁移脚本目录
+#
+# W3/W4 会在这里放 sqlx 迁移：
+#   sqlx migrate add init           创建 0001_init.sql（八张表，见 docs/04-dod.md §3）
+#   sqlx migrate run                应用未执行的迁移
+#   sqlx migrate info               查看已应用/待应用
+#
+# 为什么现在就有这个目录：`sqlx migrate info` 在目录不存在时报
+#   "error: while resolving migrations: error canonicalizing path migrations"
+# 这个报错看起来像连接问题，其实是缺目录。先占位避免误判。
