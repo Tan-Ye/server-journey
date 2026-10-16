@@ -1,0 +1,43 @@
+[workspace]
+resolve = "3"
+members = ["crates/api", "crates/domain", "crates/infra"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+
+[workspace.dependencies]
+# --- 内部 crate ---
+trade-core-domain = { path = "crates/domain" }
+trade-core-infra = { path = "crates/infra" }
+
+# --- 异步运行时 ---
+tokio = { version = "1.53", features = ["full"] }
+
+# --- Web ---
+axum = { version = "0.8.9", features = ["macros"] }
+tower = "0.5.3"
+tower-http = { version = "0.6.11", features = [
+  "trace",
+  "request-id",
+  "timeout",
+  "limit",
+] }
+
+# --- 序列化 ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+# --- 错误处理 ---
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+
+# --- 可观测 ---
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# --- 其他 ---
+uuid = { version = "1.28", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }

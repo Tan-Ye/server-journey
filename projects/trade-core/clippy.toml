@@ -1,0 +1,3 @@
+# 允许的标识符长度下限（默认 3，太短的变量名容易看不懂）
+too-many-arguments-threshold = 8
+type-complexity-threshold = 300
